@@ -1,0 +1,1955 @@
+import React, { useState, useMemo } from "react";
+import {
+  Plus, LogIn, LogOut, UtensilsCrossed, Wine, Sparkles, Shirt, Package, Search,
+  Building2, User, Landmark, X, Check, Clock, ChevronLeft, ChevronRight, FileText,
+  ArrowLeft, Printer, Camera, Phone, Mail, DollarSign, TrendingUp, Link2, FileSignature,
+  CheckCircle2, AlertCircle, Edit3, ShieldCheck, Download, Boxes, Users, ScanLine, Minus, Trash2, ImageIcon
+} from "lucide-react";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
+import * as XLSX from "xlsx";
+
+// Carga Tesseract.js (OCR real) dinámicamente desde CDN la primera vez que se necesita.
+let tesseractCargando = null;
+function cargarTesseract() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (tesseractCargando) return tesseractCargando;
+  tesseractCargando = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js";
+    script.onload = () => resolve(window.Tesseract);
+    script.onerror = () => reject(new Error("No se pudo cargar el motor OCR"));
+    document.head.appendChild(script);
+  });
+  return tesseractCargando;
+}
+
+// ================= LECTURA DE MRZ (Machine Readable Zone) =================
+// La cédula ecuatoriana trae en el reverso 3 líneas de 30 caracteres (formato TD1, ICAO 9303),
+// pensadas justamente para lectura automática: son mucho más confiables que leer el texto
+// libre del frente. Ejemplo real:
+//   I<ECU0741032423<<<<<1757093081
+//   0506225M3401169ECU<NO<DONANTE6
+//   LEMA<YAUCAN<<DIEGO<ARMANDO<<<<
+function limpiarLineaMRZ(l) {
+  return l.toUpperCase().replace(/[^A-Z0-9<]/g, "");
+}
+
+function decodeMRZFecha(yymmdd, esVencimiento) {
+  if (!/^\d{6}$/.test(yymmdd)) return "";
+  const yy = parseInt(yymmdd.slice(0, 2), 10);
+  const mm = yymmdd.slice(2, 4);
+  const dd = yymmdd.slice(4, 6);
+  // El campo de vencimiento de la cédula siempre cae en el 2000+; el de nacimiento se infiere por cercanía al año actual.
+  const siglo = esVencimiento ? 2000 : (yy <= new Date().getFullYear() % 100 ? 2000 : 1900);
+  return `${dd}/${mm}/${siglo + yy}`;
+}
+
+function parseMRZTD1(textoCrudo) {
+  const lineas = textoCrudo.split("\n").map(limpiarLineaMRZ).filter((l) => l.length >= 20);
+  for (let i = 0; i <= lineas.length - 3; i++) {
+    const [l1, l2, l3] = [lineas[i], lineas[i + 1], lineas[i + 2]];
+    if (!/^[IP]</.test(l1) || l1.length < 28 || l2.length < 28 || l3.length < 10) continue;
+    try {
+      const numeroDocumento = l1.slice(5, 14).replace(/</g, "");
+      const cedula = l1.slice(20, 30).replace(/</g, "");
+      const sexo = l2[7] === "M" || l2[7] === "F" ? l2[7] : "";
+      const fechaNacimiento = decodeMRZFecha(l2.slice(0, 6), false);
+      const fechaVencimiento = decodeMRZFecha(l2.slice(8, 14), true);
+      const nacionalidad = l2.slice(15, 18).replace(/</g, "");
+      const opcional = l2.slice(18, 29);
+      const donante = opcional.includes("SI") ? "SI" : opcional.includes("NO") ? "NO" : "";
+      const partes = l3.split("<<").map((p) => p.replace(/</g, " ").trim());
+      const apellidos = partes[0] || "";
+      const nombres = partes[1] || "";
+      if (!cedula || (!apellidos && !nombres)) continue;
+      return {
+        cedula, numeroDocumento, apellidos, nombres,
+        nombreCompleto: [apellidos, nombres].filter(Boolean).join(" "),
+        sexo, fechaNacimiento, fechaVencimiento, nacionalidad, donante,
+        fuente: "MRZ",
+      };
+    } catch (e) { /* línea no concluyente, sigue probando */ }
+  }
+  return null;
+}
+
+// Heurísticas para los campos que NO viven en el MRZ (solo aparecen como texto libre
+// en el frente/reverso de la cédula): lugar de nacimiento, estado civil, padres, sangre, emisión.
+function parseTextoLibreCedula(textoCrudo) {
+  const texto = textoCrudo.toUpperCase();
+  const lineas = texto.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const buscarDespuesDe = (etiquetas) => {
+    for (let i = 0; i < lineas.length; i++) {
+      for (const et of etiquetas) {
+        if (lineas[i].includes(et)) {
+          const resto = lineas[i].replace(et, "").trim();
+          if (resto.length > 1) return resto;
+          if (lineas[i + 1]) return lineas[i + 1];
+        }
+      }
+    }
+    return "";
+  };
+
+  const estadoCivilMatch = texto.match(/SOLTER[OA]|CASAD[OA]|DIVORCIAD[OA]|VIUD[OA]|UNION LIBRE/);
+  const tipoSangreMatch = texto.match(/\b(A|B|AB|O)[+-]\b/);
+  const lugarFechaEmisionLinea = buscarDespuesDe(["LUGAR Y FECHA DE EMISIÓN", "LUGAR Y FECHA DE EMISION"]);
+
+  return {
+    lugarNacimiento: buscarDespuesDe(["LUGAR DE NACIMIENTO", "LUGAR NACIMIENTO"]),
+    estadoCivil: estadoCivilMatch ? estadoCivilMatch[0] : "",
+    nombrePadre: buscarDespuesDe(["APELLIDOS Y NOMBRES DEL PADRE"]),
+    nombreMadre: buscarDespuesDe(["APELLIDOS Y NOMBRES DE LA MADRE"]),
+    tipoSangre: tipoSangreMatch ? tipoSangreMatch[0] : "",
+    lugarFechaEmision: lugarFechaEmisionLinea,
+  };
+}
+
+// Combina ambas lecturas: el MRZ manda en los campos donde aparece (es exacto),
+// el texto libre completa lo que el MRZ no trae.
+function parseCedulaTexto(textoCrudo) {
+  const mrz = parseMRZTD1(textoCrudo);
+  const libre = parseTextoLibreCedula(textoCrudo);
+  const cedulaMatch = textoCrudo.match(/\b\d{10}\b/);
+  const fechaMatch = textoCrudo.match(/\b(\d{2}[\/\-.]\d{2}[\/\-.]\d{4})\b/g) || [];
+
+  return {
+    cedula: mrz?.cedula || (cedulaMatch ? cedulaMatch[0] : ""),
+    numeroDocumento: mrz?.numeroDocumento || "",
+    nombreCompleto: mrz?.nombreCompleto || "",
+    apellidos: mrz?.apellidos || "",
+    nombres: mrz?.nombres || "",
+    fechaNacimiento: mrz?.fechaNacimiento || fechaMatch[0] || "",
+    fechaVencimiento: mrz?.fechaVencimiento || fechaMatch[1] || "",
+    sexo: mrz?.sexo || "",
+    nacionalidad: mrz?.nacionalidad || "",
+    donante: mrz?.donante || "",
+    ...libre,
+    leidoPorMRZ: !!mrz,
+    textoCrudo,
+  };
+}
+
+
+
+// ================= CONSTANTES =================
+const TIPO_INFO = {
+  B2C: { label: "Particular", icon: User, color: "#9C6B3E", bg: "#FBF3E9" },
+  B2B: { label: "Empresa", icon: Building2, color: "#3E6B5C", bg: "#EAF3EF" },
+  B2G: { label: "Gobierno", icon: Landmark, color: "#5C5390", bg: "#F0EEF8" },
+};
+
+const CONSUMO_INFO = {
+  Alimentacion: { label: "Alimentación", icon: UtensilsCrossed },
+  Bar: { label: "Bar", icon: Wine },
+  Minibar: { label: "Minibar", icon: Package },
+  Spa: { label: "Spa", icon: Sparkles },
+  Lavanderia: { label: "Lavandería", icon: Shirt },
+  Otros: { label: "Otros", icon: Package },
+};
+
+const HOY = new Date().toISOString().slice(0, 10);
+
+// ================= DATOS DE PRUEBA =================
+// Un contrato define: con quién, vigencia, tarifa de alojamiento negociada,
+// y qué categorías de consumo paga la EMPRESA/ENTIDAD vs. lo que paga el huésped de su bolsillo.
+const SEED_CONTRATOS = [
+  {
+    id: "ct1",
+    entidad: "Constructora Andes S.A.",
+    tipo: "B2B",
+    numero: "CT-2026-014",
+    vigenciaInicio: "2026-01-01",
+    vigenciaFin: "2026-12-31",
+    tarifaNoche: 65.0,
+    servicios: { Alimentacion: true, Bar: false, Minibar: false, Spa: false, Lavanderia: true },
+    estado: "activo",
+  },
+  {
+    id: "ct2",
+    entidad: "Prefectura de Esmeraldas",
+    tipo: "B2G",
+    numero: "EVT-2026-Junio",
+    vigenciaInicio: "2026-06-01",
+    vigenciaFin: "2026-06-30",
+    tarifaNoche: 0, // evento, no pernoctación estándar
+    servicios: { Alimentacion: true, Bar: false, Minibar: true, Spa: false, Lavanderia: true },
+    estado: "activo",
+  },
+];
+
+const SEED_HUESPEDES = [
+  { id: "h1", tipo: "B2C", nombre: "María José Salazar", doc: "1712345678", telefono: "0991234567", email: "mjsalazar@gmail.com", habitacion: "204", checkIn: HOY, checkOut: null, estado: "activo", entidad: null, contratoId: null, tarifaNoche: 45.0, estadoPago: "pendiente" },
+  { id: "h2", tipo: "B2B", nombre: "Carlos Aguirre", doc: "1798765432", telefono: "0987654321", email: "carlos.aguirre@andes.ec", habitacion: "310", checkIn: HOY, checkOut: null, estado: "activo", entidad: "Constructora Andes S.A.", contratoId: "ct1", tarifaNoche: 65.0, estadoPago: "pagado" },
+  { id: "h3", tipo: "B2B", nombre: "Lucía Mendoza", doc: "1755512345", telefono: "0998887766", email: "lmendoza@andes.ec", habitacion: "310", checkIn: HOY, checkOut: null, estado: "activo", entidad: "Constructora Andes S.A.", contratoId: "ct1", tarifaNoche: 65.0, estadoPago: "pagado" },
+  { id: "h4", tipo: "B2G", nombre: "Delegación Prefectura Esmeraldas", doc: "GADPE-001", telefono: "062712345", email: "logistica@esmeraldas.gob.ec", habitacion: "Salón Norte", checkIn: HOY, checkOut: null, estado: "activo", entidad: "Prefectura de Esmeraldas", contratoId: "ct2", tarifaNoche: 0, estadoPago: "pendiente" },
+];
+
+const SEED_CONSUMOS = [
+  { id: "c1", huespedId: "h1", categoria: "Bar", detalle: "2 cervezas artesanales", monto: 8.5, fecha: HOY, pagadoPor: "huesped", estadoPago: "pendiente" },
+  { id: "c2", huespedId: "h2", categoria: "Alimentacion", detalle: "Almuerzo ejecutivo", monto: 12.0, fecha: HOY, pagadoPor: "empresa", estadoPago: "pagado" },
+  { id: "c3", huespedId: "h3", categoria: "Spa", detalle: "Masaje relajante 50 min", monto: 35.0, fecha: HOY, pagadoPor: "huesped", estadoPago: "pendiente" },
+  { id: "c4", huespedId: "h4", categoria: "Lavanderia", detalle: "Servicio de planchado (delegación)", monto: 18.0, fecha: HOY, pagadoPor: "empresa", estadoPago: "pendiente" },
+  { id: "c5", huespedId: "h2", categoria: "Minibar", detalle: "Agua y snacks", monto: 6.5, fecha: HOY, pagadoPor: "huesped", estadoPago: "pagado" },
+];
+
+const SEED_INVENTARIO = [
+  { id: "p1", nombre: "Gaseosa Pepsi 500ml", categoria: "Bar", tipo: "producto", precio: 1.5, stock: 48, unidad: "500ml" },
+  { id: "p2", nombre: "Cerveza Club 1.5L", categoria: "Bar", tipo: "producto", precio: 4.5, stock: 24, unidad: "1.5L" },
+  { id: "p3", nombre: "Papas Ruffles 200g", categoria: "Bar", tipo: "producto", precio: 2.0, stock: 36, unidad: "200g" },
+  { id: "p4", nombre: "Agua sin gas 600ml", categoria: "Minibar", tipo: "producto", precio: 1.0, stock: 60, unidad: "600ml" },
+  { id: "p5", nombre: "Almuerzo ejecutivo", categoria: "Alimentacion", tipo: "plato", precio: 12.0, stock: null, unidad: "porción" },
+  { id: "p6", nombre: "Plato a la carta - Lomo fino", categoria: "Alimentacion", tipo: "plato", precio: 18.5, stock: null, unidad: "porción" },
+  { id: "p7", nombre: "Masaje relajante 50 min", categoria: "Spa", tipo: "servicio", precio: 35.0, stock: null, unidad: "sesión" },
+  { id: "p8", nombre: "Lavado y planchado (prenda)", categoria: "Lavanderia", tipo: "servicio", precio: 3.0, stock: null, unidad: "prenda" },
+];
+
+const SEED_INVITADOS = [
+  {
+    id: "i1", eventoId: "ct2", nombres: "PEDRO ANDRÉS", apellidos: "RAMÍREZ TORRES", cedula: "1709988776",
+    numeroDocumento: "070998877", nacionalidad: "ECUATORIANA",
+    fechaNacimiento: "12/04/1985", fechaVencimiento: "12/04/2033", sexo: "M", estadoCivil: "CASADO", lugarNacimiento: "QUITO",
+    nombrePadre: "", nombreMadre: "", tipoSangre: "O+", donante: "NO", lugarFechaEmision: "QUITO 12 ABR 2025",
+    telefono: "0991122334", email: "pramirez@esmeraldas.gob.ec", fotoCedula: null, fechaAsistencia: HOY, observaciones: "",
+    asistenciaConfirmada: false, horaConfirmacion: null, fotoVerificacion: null, cedulaVerificacionCoincide: null, verificacionManual: false,
+  },
+];
+
+function nuevoId(prefix) {
+  return prefix + Math.random().toString(36).slice(2, 8);
+}
+
+// ================= UTILIDADES =================
+function rangoDias(inicioStr, finStr) {
+  const dias = [];
+  let cur = new Date(inicioStr + "T00:00:00");
+  const fin = new Date((finStr || HOY) + "T00:00:00");
+  while (cur <= fin) {
+    dias.push(cur.toISOString().slice(0, 10));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return dias;
+}
+
+const MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+const DIAS_SEMANA = ["L", "M", "X", "J", "V", "S", "D"];
+
+// Días reales de estadía: si el admin los marcó manualmente en el calendario, se usan esos;
+// si no, se infiere el rango continuo entre check-in y check-out.
+function diasDeRegistro(r) {
+  return r.diasHospedaje && r.diasHospedaje.length ? r.diasHospedaje : rangoDias(r.checkIn, r.checkOut);
+}
+
+function construirPerfiles(huespedes) {
+  const mapa = new Map();
+  for (const h of huespedes) {
+    const key = h.doc || h.nombre;
+    if (!mapa.has(key)) {
+      mapa.set(key, { clienteId: key, nombre: h.nombre, doc: h.doc, telefono: h.telefono, email: h.email, tipo: h.tipo, entidad: h.entidad, contratoId: h.contratoId, registros: [] });
+    }
+    mapa.get(key).registros.push(h);
+  }
+  return Array.from(mapa.values());
+}
+
+function agruparPorEntidad(perfiles) {
+  const grupos = new Map();
+  for (const p of perfiles) {
+    const key = p.tipo === "B2C" ? `__individual__${p.clienteId}` : p.entidad || "Sin entidad asignada";
+    if (!grupos.has(key)) {
+      grupos.set(key, { entidad: p.tipo === "B2C" ? null : (p.entidad || "Sin entidad asignada"), tipo: p.tipo, perfiles: [] });
+    }
+    grupos.get(key).perfiles.push(p);
+  }
+  return Array.from(grupos.values());
+}
+
+// Dado un contrato y una categoría de consumo, ¿quién paga? "empresa" o "huesped"
+function quienPaga(contrato, categoria) {
+  if (!contrato) return "huesped";
+  return contrato.servicios[categoria] ? "empresa" : "huesped";
+}
+
+// ================= COMPONENTES BASE =================
+function Badge({ tipo }) {
+  const info = TIPO_INFO[tipo];
+  const Icon = info.icon;
+  return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold tracking-wide" style={{ color: info.color, backgroundColor: info.bg }}>
+      <Icon size={13} strokeWidth={2.5} />
+      {info.label}
+    </span>
+  );
+}
+
+function EstadoPill({ estado }) {
+  const activo = estado === "activo";
+  return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold" style={{ color: activo ? "#2E5A45" : "#6B6358", backgroundColor: activo ? "#E3F1E8" : "#EFECE6" }}>
+      <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: activo ? "#3E8E5F" : "#A39C8F" }} />
+      {activo ? "En estadía" : "Check-out"}
+    </span>
+  );
+}
+
+function PagoPill({ estado, onClick }) {
+  const pagado = estado === "pagado";
+  const Comp = onClick ? "button" : "span";
+  return (
+    <Comp onClick={onClick} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold" style={{ color: pagado ? "#2E5A45" : "#9C4221", backgroundColor: pagado ? "#E3F1E8" : "#FBEAE3" }}>
+      {pagado ? <CheckCircle2 size={12} /> : <AlertCircle size={12} />}
+      {pagado ? "Pagado" : "Pendiente de pago"}
+    </Comp>
+  );
+}
+
+function Modal({ open, onClose, title, children, width = "max-w-lg" }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm p-0 sm:p-4">
+      <div className={`bg-[#FFFDFA] w-full ${width} rounded-t-2xl sm:rounded-2xl shadow-2xl max-h-[90vh] overflow-y-auto border border-[#E8E1D4]`}>
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[#EDE7DA] sticky top-0 bg-[#FFFDFA]">
+          <h3 className="font-serif text-lg text-[#2B2620]">{title}</h3>
+          <button onClick={onClose} className="text-[#8A8273] hover:text-[#2B2620] transition-colors"><X size={20} /></button>
+        </div>
+        <div className="p-6">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children, hint }) {
+  return (
+    <label className="block mb-4">
+      <span className="block text-xs font-semibold uppercase tracking-wider text-[#8A8273] mb-1.5">{label}</span>
+      {children}
+      {hint && <span className="block text-[11px] text-[#A39C8F] mt-1">{hint}</span>}
+    </label>
+  );
+}
+
+const inputCls = "w-full px-3.5 py-2.5 rounded-lg border border-[#DCD4C3] bg-white text-[#2B2620] focus:outline-none focus:ring-2 focus:ring-[#9C6B3E]/40 focus:border-[#9C6B3E] transition-all text-sm";
+
+// ================= ESCANEO DE CÉDULA (OCR REAL POR FOTO) =================
+// Usa Tesseract.js (cargado desde CDN en el navegador) para leer el texto de la foto
+// y extraer los campos de la cédula con expresiones regulares. La foto se guarda en
+// base64 junto al registro. La precisión depende de la foto: todos los campos quedan
+// editables después para que recepción los corrija si hace falta.
+function CapturaCedulaOCR({ onDatos }) {
+  const [estado, setEstado] = useState("idle"); // idle | leyendo | ok | error
+  const [foto, setFoto] = useState(null);
+  const [error, setError] = useState("");
+
+  const manejarArchivo = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError("");
+    setEstado("leyendo");
+
+    const dataUrl = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.readAsDataURL(file);
+    });
+    setFoto(dataUrl);
+
+    try {
+      const Tesseract = await cargarTesseract();
+      const { data } = await Tesseract.recognize(dataUrl, "spa");
+      const campos = parseCedulaTexto(data.text || "");
+      onDatos({ ...campos, fotoCedula: dataUrl });
+      setEstado(campos.leidoPorMRZ ? "ok-mrz" : "ok-parcial");
+    } catch (err) {
+      setError("No se pudo leer el texto automáticamente. Completa los datos manualmente.");
+      onDatos({ fotoCedula: dataUrl });
+      setEstado("error");
+    }
+  };
+
+  return (
+    <div className="mb-4 p-3.5 rounded-lg border border-dashed border-[#DCD4C3] bg-[#FBF9F5]">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5 min-w-0">
+          {foto ? (
+            <img src={foto} alt="Cédula" className="w-9 h-9 rounded-lg object-cover shrink-0 border border-[#DCD4C3]" />
+          ) : (
+            <div className="w-9 h-9 rounded-lg bg-[#2B2620] text-white flex items-center justify-center shrink-0"><ScanLine size={16} /></div>
+          )}
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-[#2B2620]">Escanear cédula (OCR)</p>
+            <p className="text-[11px] truncate" style={{ color: estado === "ok-mrz" ? "#2E5A45" : estado === "ok-parcial" ? "#9C6B3E" : "#8A8273" }}>
+              {estado === "leyendo" ? "Leyendo texto de la imagen..."
+                : estado === "ok-mrz" ? "✓ Datos leídos del código MRZ (alta precisión) — revisa igual"
+                : estado === "ok-parcial" ? "Datos leídos del texto del frente — revisa con cuidado"
+                : "Completa los datos automáticamente desde una foto"}
+            </p>
+          </div>
+        </div>
+        <label className="px-3 py-2 rounded-lg bg-white border border-[#DCD4C3] text-xs font-semibold text-[#5C5346] cursor-pointer hover:bg-[#F0EBE0] transition-colors whitespace-nowrap shrink-0">
+          {estado === "leyendo" ? "Leyendo..." : foto ? "Tomar otra" : "Tomar foto"}
+          <input type="file" accept="image/*" capture="environment" className="hidden" onChange={manejarArchivo} disabled={estado === "leyendo"} />
+        </label>
+      </div>
+      {error && <p className="text-[11px] text-[#9C4221] mt-2">{error}</p>}
+      <p className="text-[10px] text-[#A39C8F] mt-2">Tip: para mayor precisión, fotografía el <strong>reverso</strong> (las 3 líneas de texto en la parte inferior) — ahí está el código de lectura automática.</p>
+    </div>
+  );
+}
+
+// ================= FORMULARIO CHECK-IN =================
+function FormCheckIn({ onSave, onClose, contratos }) {
+  const [tipo, setTipo] = useState("B2C");
+  const [nombre, setNombre] = useState("");
+  const [doc, setDoc] = useState("");
+  const [telefono, setTelefono] = useState("");
+  const [email, setEmail] = useState("");
+  const [habitacion, setHabitacion] = useState("");
+  const [contratoId, setContratoId] = useState("");
+  const [tarifaManual, setTarifaManual] = useState("");
+  const [fotoCedula, setFotoCedula] = useState(null);
+  const [observaciones, setObservaciones] = useState("");
+
+  const contratosDisponibles = contratos.filter((c) => c.tipo === tipo && c.estado === "activo");
+  const contratoSel = contratos.find((c) => c.id === contratoId);
+
+  const submit = () => {
+    if (!nombre.trim()) return;
+    onSave({
+      id: nuevoId("h"),
+      tipo,
+      nombre: nombre.trim(),
+      doc: doc.trim(),
+      telefono: telefono.trim(),
+      email: email.trim(),
+      habitacion: habitacion.trim(),
+      checkIn: HOY,
+      checkOut: null,
+      diasHospedaje: [],
+      estado: "activo",
+      entidad: tipo === "B2C" ? null : (contratoSel?.entidad || ""),
+      contratoId: tipo === "B2C" ? null : contratoId || null,
+      tarifaNoche: tipo === "B2C" ? parseFloat(tarifaManual || 0) : (contratoSel?.tarifaNoche ?? 0),
+      estadoPago: "pendiente",
+      fotoCedula,
+      observaciones: observaciones.trim(),
+    });
+    onClose();
+  };
+
+  return (
+    <div>
+      <CapturaCedulaOCR onDatos={(d) => {
+        if (d.nombreCompleto) setNombre(d.nombreCompleto);
+        if (d.cedula) setDoc(d.cedula);
+        if (d.fotoCedula) setFotoCedula(d.fotoCedula);
+      }} />
+
+      <Field label="Tipo de huésped">
+        <div className="grid grid-cols-3 gap-2">
+          {Object.entries(TIPO_INFO).map(([key, info]) => {
+            const Icon = info.icon;
+            const active = tipo === key;
+            return (
+              <button key={key} onClick={() => { setTipo(key); setContratoId(""); }} className="flex flex-col items-center gap-1.5 py-3 rounded-xl border-2 transition-all text-xs font-semibold"
+                style={{ borderColor: active ? info.color : "#E8E1D4", backgroundColor: active ? info.bg : "white", color: active ? info.color : "#8A8273" }}>
+                <Icon size={18} />
+                {info.label}
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+
+      <Field label={tipo === "B2C" ? "Nombre del huésped" : tipo === "B2B" ? "Nombre de la persona (visita)" : "Nombre del delegado / grupo"}>
+        <input className={inputCls} value={nombre} onChange={(e) => setNombre(e.target.value)} placeholder="Ej. María José Salazar" />
+      </Field>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Documento / ID">
+          <input className={inputCls} value={doc} onChange={(e) => setDoc(e.target.value)} placeholder="Cédula / RUC" />
+        </Field>
+        <Field label="Habitación / Espacio">
+          <input className={inputCls} value={habitacion} onChange={(e) => setHabitacion(e.target.value)} placeholder="Ej. 204" />
+        </Field>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Teléfono">
+          <input className={inputCls} value={telefono} onChange={(e) => setTelefono(e.target.value)} placeholder="09XXXXXXXX" />
+        </Field>
+        <Field label="Correo electrónico">
+          <input className={inputCls} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="correo@ejemplo.com" />
+        </Field>
+      </div>
+
+      {tipo === "B2C" ? (
+        <Field label="Tarifa por noche (USD)" hint="Tarifa estándar para huésped particular.">
+          <input className={inputCls} type="number" step="0.01" value={tarifaManual} onChange={(e) => setTarifaManual(e.target.value)} placeholder="45.00" />
+        </Field>
+      ) : (
+        <Field label="Contrato vinculado" hint={contratosDisponibles.length === 0 ? "No hay contratos activos de este tipo. Créalo en la pestaña Contratos." : "La tarifa y los servicios cubiertos se toman del contrato."}>
+          <select className={inputCls} value={contratoId} onChange={(e) => setContratoId(e.target.value)}>
+            <option value="">Selecciona un contrato...</option>
+            {contratosDisponibles.map((c) => (
+              <option key={c.id} value={c.id}>{c.entidad} — {c.numero} (${c.tarifaNoche}/noche)</option>
+            ))}
+          </select>
+        </Field>
+      )}
+
+      <Field label="Observaciones"><textarea className={inputCls} rows={2} value={observaciones} onChange={(e) => setObservaciones(e.target.value)} placeholder="Notas internas (opcional)" /></Field>
+
+      <button onClick={submit} disabled={!nombre.trim()} className="w-full mt-2 py-3 rounded-lg font-semibold text-sm text-white bg-[#2B2620] hover:bg-[#3E372D] disabled:opacity-40 transition-colors flex items-center justify-center gap-2">
+        <LogIn size={16} /> Registrar check-in
+      </button>
+    </div>
+  );
+}
+
+// ================= FORMULARIO CONSUMO =================
+function FormConsumo({ huespedes, contratos, inventario, huespedPreseleccionado, onSave, onClose }) {
+  const [huespedId, setHuespedId] = useState(huespedPreseleccionado || huespedes[0]?.id || "");
+  const [categoria, setCategoria] = useState("Alimentacion");
+  const [productoId, setProductoId] = useState("");
+  const [cantidad, setCantidad] = useState(1);
+  const [detalleManual, setDetalleManual] = useState("");
+  const [montoManual, setMontoManual] = useState("");
+
+  const huesped = huespedes.find((h) => h.id === huespedId);
+  const contrato = contratos.find((c) => c.id === huesped?.contratoId);
+  const pagaQuien = quienPaga(contrato, categoria);
+
+  const productosCategoria = inventario.filter((p) => p.categoria === categoria);
+  const producto = productosCategoria.find((p) => p.id === productoId);
+  const esManual = productoId === "manual";
+
+  const detalleFinal = esManual ? detalleManual.trim() : (producto ? `${producto.nombre}${cantidad > 1 ? ` x${cantidad}` : ""}` : "");
+  const montoFinal = esManual ? parseFloat(montoManual || 0) : (producto ? producto.precio * cantidad : 0);
+
+  const submit = () => {
+    if (!huespedId || !detalleFinal || !montoFinal) return;
+    onSave({
+      id: nuevoId("c"), huespedId, categoria, productoId: esManual ? null : productoId,
+      detalle: detalleFinal, cantidad: esManual ? 1 : cantidad, precioUnitario: esManual ? montoFinal : producto?.precio,
+      monto: Number(montoFinal.toFixed(2)), fecha: HOY, pagadoPor: pagaQuien, estadoPago: "pendiente",
+    });
+    onClose();
+  };
+
+  return (
+    <div>
+      <Field label="Huésped">
+        <select className={inputCls} value={huespedId} onChange={(e) => setHuespedId(e.target.value)}>
+          {huespedes.map((h) => (<option key={h.id} value={h.id}>{h.nombre} · Hab. {h.habitacion}</option>))}
+        </select>
+      </Field>
+
+      <Field label="Categoría">
+        <div className="grid grid-cols-3 gap-2">
+          {Object.entries(CONSUMO_INFO).map(([key, info]) => {
+            const Icon = info.icon;
+            const active = categoria === key;
+            return (
+              <button key={key} onClick={() => { setCategoria(key); setProductoId(""); }} className="flex flex-col items-center gap-1 py-2.5 rounded-lg border-2 text-[11px] font-semibold transition-all"
+                style={{ borderColor: active ? "#9C6B3E" : "#E8E1D4", backgroundColor: active ? "#FBF3E9" : "white", color: active ? "#9C6B3E" : "#8A8273" }}>
+                <Icon size={16} />
+                {info.label}
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+
+      <Field label="Producto / servicio">
+        <select className={inputCls} value={productoId} onChange={(e) => { setProductoId(e.target.value); setCantidad(1); }}>
+          <option value="">Selecciona del inventario...</option>
+          {productosCategoria.map((p) => (
+            <option key={p.id} value={p.id}>{p.nombre} ({p.unidad}) — ${p.precio.toFixed(2)}{p.stock !== null ? ` · stock ${p.stock}` : ""}</option>
+          ))}
+          <option value="manual">Otro (ingresar manualmente)</option>
+        </select>
+      </Field>
+
+      {producto && (
+        <Field label="Cantidad">
+          <div className="flex items-center gap-3">
+            <button onClick={() => setCantidad((c) => Math.max(1, c - 1))} className="w-9 h-9 rounded-lg border border-[#DCD4C3] flex items-center justify-center text-[#5C5346] hover:bg-[#F0EBE0]"><Minus size={14} /></button>
+            <span className="text-sm font-semibold text-[#2B2620] w-6 text-center">{cantidad}</span>
+            <button onClick={() => setCantidad((c) => c + 1)} className="w-9 h-9 rounded-lg border border-[#DCD4C3] flex items-center justify-center text-[#5C5346] hover:bg-[#F0EBE0]"><Plus size={14} /></button>
+            <span className="text-xs text-[#8A8273] ml-auto">Subtotal: <strong className="text-[#9C6B3E]">${(producto.precio * cantidad).toFixed(2)}</strong></span>
+          </div>
+        </Field>
+      )}
+
+      {esManual && (
+        <>
+          <Field label="Detalle"><input className={inputCls} value={detalleManual} onChange={(e) => setDetalleManual(e.target.value)} placeholder="Ej. Servicio especial" /></Field>
+          <Field label="Monto (USD)"><input className={inputCls} type="number" step="0.01" value={montoManual} onChange={(e) => setMontoManual(e.target.value)} placeholder="0.00" /></Field>
+        </>
+      )}
+
+      {contrato && (
+        <div className="mb-4 px-3.5 py-2.5 rounded-lg text-xs font-medium flex items-center gap-2" style={{ backgroundColor: pagaQuien === "empresa" ? "#EAF3EF" : "#FBF3E9", color: pagaQuien === "empresa" ? "#3E6B5C" : "#9C6B3E" }}>
+          <FileSignature size={14} />
+          Según el contrato {contrato.numero}, este consumo lo paga: <strong>{pagaQuien === "empresa" ? contrato.entidad : "el huésped (personal)"}</strong>
+        </div>
+      )}
+
+      <button onClick={submit} disabled={!huespedId || !detalleFinal || !montoFinal} className="w-full mt-2 py-3 rounded-lg font-semibold text-sm text-white bg-[#2B2620] hover:bg-[#3E372D] disabled:opacity-40 transition-colors flex items-center justify-center gap-2">
+        <Plus size={16} /> Registrar consumo
+      </button>
+    </div>
+  );
+}
+
+// ================= CALENDARIO DE ESTADÍAS =================
+// Si editable=true y se entrega un único registro (registroActivo), el administrador
+// puede tocar/clickear cada día para marcarlo o desmarcarlo como día de hospedaje.
+function CalendarioEstadias({ registros, tipo, editable = false, registroActivo = null, onToggleDia }) {
+  const diasMarcados = useMemo(() => {
+    const set = new Set();
+    registros.forEach((r) => diasDeRegistro(r).forEach((d) => set.add(d)));
+    return set;
+  }, [registros]);
+
+  const hoyDate = new Date(HOY + "T00:00:00");
+  const [mes, setMes] = useState(hoyDate.getMonth());
+  const [anio, setAnio] = useState(hoyDate.getFullYear());
+
+  const primerDia = new Date(anio, mes, 1);
+  const diasEnMes = new Date(anio, mes + 1, 0).getDate();
+  const offset = (primerDia.getDay() + 6) % 7;
+
+  const celdas = [];
+  for (let i = 0; i < offset; i++) celdas.push(null);
+  for (let d = 1; d <= diasEnMes; d++) celdas.push(d);
+
+  const color = TIPO_INFO[tipo].color;
+  const bg = TIPO_INFO[tipo].bg;
+
+  const cambiarMes = (delta) => {
+    let m = mes + delta, a = anio;
+    if (m < 0) { m = 11; a -= 1; }
+    if (m > 11) { m = 0; a += 1; }
+    setMes(m); setAnio(a);
+  };
+
+  return (
+    <div className="bg-white rounded-xl border border-[#EDE7DA] p-4">
+      <div className="flex items-center justify-between mb-3">
+        <button onClick={() => cambiarMes(-1)} className="p-1.5 rounded-md hover:bg-[#F0EBE0] text-[#8A8273]"><ChevronLeft size={16} /></button>
+        <p className="text-sm font-semibold text-[#2B2620] font-serif">{MESES[mes]} {anio}</p>
+        <button onClick={() => cambiarMes(1)} className="p-1.5 rounded-md hover:bg-[#F0EBE0] text-[#8A8273]"><ChevronRight size={16} /></button>
+      </div>
+      <div className="grid grid-cols-7 gap-1 mb-1">
+        {DIAS_SEMANA.map((d) => (<div key={d} className="text-center text-[10px] font-semibold text-[#A39C8F] py-1">{d}</div>))}
+      </div>
+      <div className="grid grid-cols-7 gap-1">
+        {celdas.map((d, i) => {
+          if (d === null) return <div key={i} />;
+          const fecha = `${anio}-${String(mes + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+          const marcado = diasMarcados.has(fecha);
+          const esHoy = fecha === HOY;
+          const Comp = editable ? "button" : "div";
+          return (
+            <Comp key={i} onClick={editable ? () => onToggleDia(fecha) : undefined}
+              className={`aspect-square flex items-center justify-center rounded-md text-xs font-medium relative ${editable ? "cursor-pointer hover:ring-2 hover:ring-[#9C6B3E]/40" : ""}`}
+              style={{ backgroundColor: marcado ? bg : "transparent", color: marcado ? color : "#C2B9A6", border: esHoy ? `1.5px solid ${marcado ? color : "#DCD4C3"}` : "1.5px solid transparent", fontWeight: marcado ? 700 : 400 }}>
+              {d}
+            </Comp>
+          );
+        })}
+      </div>
+      <div className="flex items-center gap-1.5 mt-3 text-[11px] text-[#8A8273]">
+        <span className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: bg, border: `1px solid ${color}` }} />
+        Días hospedado ({TIPO_INFO[tipo].label.toLowerCase()})
+      </div>
+      {editable && <p className="text-[11px] text-[#9C6B3E] mt-2">Toca un día para marcarlo o desmarcarlo como hospedaje. Se aplica a la estadía más reciente.</p>}
+    </div>
+  );
+}
+
+// ================= INFORMES =================
+function generarTextoInformeCliente(perfil, consumos, contratos) {
+  const cs = consumos.filter((c) => perfil.registros.some((r) => r.id === c.huespedId));
+  const totalConsumos = cs.reduce((s, c) => s + c.monto, 0);
+  const totalDias = new Set(perfil.registros.flatMap((r) => diasDeRegistro(r))).size;
+  const porCategoria = {};
+  cs.forEach((c) => { porCategoria[c.categoria] = (porCategoria[c.categoria] || 0) + c.monto; });
+  const totalEmpresa = cs.filter((c) => c.pagadoPor === "empresa").reduce((s, c) => s + c.monto, 0);
+  const totalHuesped = cs.filter((c) => c.pagadoPor === "huesped").reduce((s, c) => s + c.monto, 0);
+  const totalAlojamiento = perfil.registros.reduce((s, r) => s + (r.tarifaNoche || 0) * diasDeRegistro(r).length, 0);
+  const contrato = contratos.find((c) => c.id === perfil.contratoId);
+
+  let txt = `INFORME DE HUÉSPED\n${"=".repeat(40)}\n`;
+  txt += `Nombre: ${perfil.nombre}\nDocumento: ${perfil.doc}\nTeléfono: ${perfil.telefono || "-"}\nCorreo: ${perfil.email || "-"}\n`;
+  txt += `Tipo: ${TIPO_INFO[perfil.tipo].label}\n`;
+  if (perfil.entidad) txt += `Entidad: ${perfil.entidad}\n`;
+  if (contrato) txt += `Contrato: ${contrato.numero} (vigencia ${contrato.vigenciaInicio} a ${contrato.vigenciaFin})\n`;
+  txt += `Total días hospedado: ${totalDias}\nN.º de visitas/estadías: ${perfil.registros.length}\n\n`;
+  txt += `ESTADÍAS\n${"-".repeat(40)}\n`;
+  perfil.registros.forEach((r) => {
+    txt += `· ${r.checkIn} a ${r.checkOut || "(en curso)"} — Hab./Espacio ${r.habitacion} — Tarifa $${(r.tarifaNoche || 0).toFixed(2)}/noche — Pago: ${r.estadoPago === "pagado" ? "Pagado" : "Pendiente"}\n`;
+  });
+  txt += `\nCONSUMOS POR CATEGORÍA\n${"-".repeat(40)}\n`;
+  Object.entries(porCategoria).forEach(([cat, monto]) => { txt += `${CONSUMO_INFO[cat]?.label || cat}: $${monto.toFixed(2)}\n`; });
+  txt += `\nDETALLE DE CONSUMOS\n${"-".repeat(40)}\n`;
+  cs.forEach((c) => { txt += `${c.fecha} · ${CONSUMO_INFO[c.categoria]?.label} · ${c.detalle} — $${c.monto.toFixed(2)} (paga: ${c.pagadoPor === "empresa" ? "empresa/entidad" : "huésped"}, ${c.estadoPago === "pagado" ? "pagado" : "pendiente"})\n`; });
+  txt += `\nRESUMEN DE PAGOS\n${"-".repeat(40)}\n`;
+  txt += `Alojamiento (estimado): $${totalAlojamiento.toFixed(2)}\nConsumos a cargo de la empresa/entidad: $${totalEmpresa.toFixed(2)}\nConsumos a cargo del huésped: $${totalHuesped.toFixed(2)}\n`;
+  txt += `\n${"=".repeat(40)}\nTOTAL CONSUMOS: $${totalConsumos.toFixed(2)}\n`;
+  return txt;
+}
+
+function generarTextoInformeTotal(grupos, consumos, contratos) {
+  let txt = `INFORME GENERAL DEL HOTEL\nFecha de corte: ${HOY}\n${"=".repeat(40)}\n\n`;
+  let granTotal = 0;
+  grupos.forEach((g) => {
+    const nombreGrupo = g.entidad || `Particulares (B2C)`;
+    txt += `${g.entidad ? `[${TIPO_INFO[g.tipo].label}] ` : ""}${nombreGrupo}\n${"-".repeat(40)}\n`;
+    let totalGrupo = 0;
+    g.perfiles.forEach((p) => {
+      const cs = consumos.filter((c) => p.registros.some((r) => r.id === c.huespedId));
+      const total = cs.reduce((s, c) => s + c.monto, 0);
+      const dias = new Set(p.registros.flatMap((r) => diasDeRegistro(r))).size;
+      const pendiente = p.registros.some((r) => r.estadoPago === "pendiente");
+      totalGrupo += total;
+      txt += `  ${p.nombre} — ${dias} día(s), $${total.toFixed(2)} en consumos — ${pendiente ? "PAGO PENDIENTE" : "pagado"}\n`;
+    });
+    txt += `  Subtotal ${nombreGrupo}: $${totalGrupo.toFixed(2)}\n\n`;
+    granTotal += totalGrupo;
+  });
+  txt += `${"=".repeat(40)}\nTOTAL GENERAL DE CONSUMOS: $${granTotal.toFixed(2)}\n`;
+  return txt;
+}
+
+function ModalInforme({ texto, onClose }) {
+  return (
+    <Modal open={!!texto} onClose={onClose} title="Informe generado" width="max-w-xl">
+      <pre className="whitespace-pre-wrap text-xs bg-[#FBF9F5] border border-[#EDE7DA] rounded-lg p-4 text-[#3E372D] leading-relaxed max-h-[55vh] overflow-y-auto font-mono">{texto}</pre>
+      <div className="flex gap-2 mt-4">
+        <button onClick={() => navigator.clipboard?.writeText(texto)} className="flex-1 py-2.5 rounded-lg border border-[#DCD4C3] text-xs font-semibold text-[#5C5346] hover:bg-[#F7F4EE] transition-colors">Copiar texto</button>
+        <button onClick={() => window.print()} className="flex-1 py-2.5 rounded-lg bg-[#2B2620] text-white text-xs font-semibold hover:bg-[#3E372D] transition-colors flex items-center justify-center gap-1.5"><Printer size={13} /> Imprimir</button>
+      </div>
+    </Modal>
+  );
+}
+
+// ================= SOLICITUD DE EDICIÓN (requiere aprobación admin) =================
+function FormSolicitudEdicion({ huesped, onEnviar, onClose }) {
+  const [campo, setCampo] = useState("nombre");
+  const [valorNuevo, setValorNuevo] = useState("");
+
+  const submit = () => {
+    if (!valorNuevo.trim()) return;
+    onEnviar({ id: nuevoId("sol"), huespedId: huesped.id, nombreHuesped: huesped.nombre, campo, valorAnterior: huesped[campo] ?? "", valorNuevo: valorNuevo.trim(), estado: "pendiente", fecha: HOY });
+    onClose();
+  };
+
+  return (
+    <div>
+      <p className="text-xs text-[#8A8273] mb-4 leading-relaxed">Los cambios a datos ya registrados quedan sujetos a aprobación del administrador antes de aplicarse.</p>
+      <Field label="Campo a corregir">
+        <select className={inputCls} value={campo} onChange={(e) => setCampo(e.target.value)}>
+          <option value="nombre">Nombre</option>
+          <option value="doc">Documento</option>
+          <option value="telefono">Teléfono</option>
+          <option value="email">Correo electrónico</option>
+          <option value="habitacion">Habitación / Espacio</option>
+        </select>
+      </Field>
+      <Field label="Valor actual"><input className={inputCls} value={huesped[campo] ?? ""} disabled /></Field>
+      <Field label="Valor corregido"><input className={inputCls} value={valorNuevo} onChange={(e) => setValorNuevo(e.target.value)} placeholder="Nuevo valor" /></Field>
+      <button onClick={submit} disabled={!valorNuevo.trim()} className="w-full mt-2 py-3 rounded-lg font-semibold text-sm text-white bg-[#2B2620] hover:bg-[#3E372D] disabled:opacity-40 transition-colors flex items-center justify-center gap-2">
+        <Edit3 size={16} /> Enviar solicitud al administrador
+      </button>
+    </div>
+  );
+}
+
+// ================= PERFIL DE HUÉSPED =================
+function PerfilHuesped({ perfil, consumos, contratos, onVolver, onAbrirInforme, onSolicitarEdicion, onTogglePagoEstadia, onToggleDiaHospedaje }) {
+  const registrosOrdenados = [...perfil.registros].sort((a, b) => (a.checkIn < b.checkIn ? 1 : -1));
+  const cs = consumos.filter((c) => perfil.registros.some((r) => r.id === c.huespedId)).sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+  const totalConsumos = cs.reduce((s, c) => s + c.monto, 0);
+  const totalDias = new Set(perfil.registros.flatMap((r) => diasDeRegistro(r))).size;
+  // El total de hospedaje se recalcula en vivo: cada estadía aporta (días marcados en su calendario) × su tarifa por noche.
+  const totalHospedaje = perfil.registros.reduce((s, r) => s + diasDeRegistro(r).length * (r.tarifaNoche || 0), 0);
+  const totalGeneral = totalHospedaje + totalConsumos;
+  const contrato = contratos.find((c) => c.id === perfil.contratoId);
+
+  return (
+    <div>
+      <button onClick={onVolver} className="flex items-center gap-1.5 text-xs font-semibold text-[#8A8273] hover:text-[#2B2620] mb-4 transition-colors"><ArrowLeft size={14} /> Volver a clientes</button>
+
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <div>
+          <Badge tipo={perfil.tipo} />
+          <h2 className="font-serif text-xl text-[#2B2620] mt-2">{perfil.nombre}</h2>
+          <p className="text-xs text-[#8A8273] mt-0.5">Doc. {perfil.doc}{perfil.entidad && <> · {perfil.entidad}</>}{contrato && <> · {contrato.numero}</>}</p>
+          <div className="flex gap-3 mt-1.5 text-xs text-[#8A8273]">
+            {perfil.telefono && <span className="flex items-center gap-1"><Phone size={12} /> {perfil.telefono}</span>}
+            {perfil.email && <span className="flex items-center gap-1"><Mail size={12} /> {perfil.email}</span>}
+          </div>
+        </div>
+        <div className="flex flex-col gap-2 items-end shrink-0">
+          <button onClick={() => onAbrirInforme(generarTextoInformeCliente(perfil, consumos, contratos))} className="px-3.5 py-2 rounded-lg bg-[#2B2620] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#3E372D] transition-colors"><FileText size={14} /> Informe</button>
+          <button onClick={() => onSolicitarEdicion(perfil.registros[0])} className="text-[11px] text-[#8A8273] hover:text-[#2B2620] flex items-center gap-1 transition-colors"><Edit3 size={11} /> Solicitar corrección</button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mb-3 mt-3">
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-3.5"><p className="text-xl font-serif text-[#2B2620]">{totalDias}</p><p className="text-[11px] text-[#8A8273]">Días hospedado</p></div>
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-3.5"><p className="text-xl font-serif text-[#2B2620]">{perfil.registros.length}</p><p className="text-[11px] text-[#8A8273]">Estadías</p></div>
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-3.5"><p className="text-xl font-serif text-[#9C6B3E]">${totalHospedaje.toFixed(2)}</p><p className="text-[11px] text-[#8A8273]">Total hospedaje</p></div>
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-3.5"><p className="text-xl font-serif text-[#9C6B3E]">${totalConsumos.toFixed(2)}</p><p className="text-[11px] text-[#8A8273]">Total consumos</p></div>
+      </div>
+      <div className="bg-[#2B2620] rounded-xl p-4 mb-5 flex items-center justify-between">
+        <span className="text-xs font-semibold text-[#C2B9A6] uppercase tracking-wider">Total a pagar (hospedaje + consumos)</span>
+        <span className="text-xl font-serif text-white">${totalGeneral.toFixed(2)}</span>
+      </div>
+
+      <p className="text-xs font-semibold uppercase tracking-wider text-[#8A8273] mb-2">Calendario de estadías</p>
+      <p className="text-[11px] text-[#8A8273] mb-2 -mt-1">Cada día marcado aquí cuenta como noche de hospedaje y se suma automáticamente al total.</p>
+      <CalendarioEstadias
+        registros={perfil.registros}
+        tipo={perfil.tipo}
+        editable
+        onToggleDia={(fecha) => onToggleDiaHospedaje(registrosOrdenados[0]?.id, fecha)}
+      />
+
+      <p className="text-xs font-semibold uppercase tracking-wider text-[#8A8273] mt-6 mb-2">Estadías y estado de pago</p>
+      <div className="space-y-1.5 mb-5">
+        {registrosOrdenados.map((r) => {
+          const diasR = diasDeRegistro(r).length;
+          return (
+            <div key={r.id} className="flex items-center justify-between text-xs bg-white rounded-lg px-3.5 py-2.5 border border-[#EDE7DA] gap-2">
+              <span className="text-[#5C5346]">{r.checkIn} → {r.checkOut || "en curso"} · Hab. {r.habitacion} · {diasR} día(s) × ${(r.tarifaNoche || 0).toFixed(2)} = <strong>${(diasR * (r.tarifaNoche || 0)).toFixed(2)}</strong></span>
+              <PagoPill estado={r.estadoPago} onClick={() => onTogglePagoEstadia(r.id)} />
+            </div>
+          );
+        })}
+      </div>
+
+      <p className="text-xs font-semibold uppercase tracking-wider text-[#8A8273] mb-2">Consumos (alimentación, bar y servicios)</p>
+      <div className="space-y-1.5">
+        {cs.length === 0 && <p className="text-xs text-[#A39C8F] py-3">Sin consumos registrados.</p>}
+        {cs.map((c) => {
+          const Icon = CONSUMO_INFO[c.categoria].icon;
+          return (
+            <div key={c.id} className="flex items-center justify-between text-xs bg-white rounded-lg px-3.5 py-2.5 border border-[#EDE7DA] gap-2">
+              <span className="flex items-center gap-2 text-[#5C5346] min-w-0">
+                <Icon size={13} className="text-[#9C6B3E] shrink-0" />
+                <span className="truncate">{c.detalle} <span className="text-[#C2B9A6]">· {c.fecha} · paga {c.pagadoPor === "empresa" ? "empresa" : "huésped"}</span></span>
+              </span>
+              <span className="font-semibold text-[#2B2620] shrink-0">${c.monto.toFixed(2)}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ================= VISTA CLIENTES =================
+function VistaClientes({ huespedes, consumos, contratos, onSolicitarEdicion, onTogglePagoEstadia, onToggleDiaHospedaje }) {
+  const perfiles = useMemo(() => construirPerfiles(huespedes), [huespedes]);
+  const grupos = useMemo(() => agruparPorEntidad(perfiles), [perfiles]);
+  const [clienteAbierto, setClienteAbierto] = useState(null);
+  const [informe, setInforme] = useState(null);
+
+  if (clienteAbierto) {
+    const perfil = perfiles.find((p) => p.clienteId === clienteAbierto);
+    return (
+      <>
+        <PerfilHuesped perfil={perfil} consumos={consumos} contratos={contratos} onVolver={() => setClienteAbierto(null)} onAbrirInforme={setInforme} onSolicitarEdicion={onSolicitarEdicion} onTogglePagoEstadia={onTogglePagoEstadia} onToggleDiaHospedaje={onToggleDiaHospedaje} />
+        <ModalInforme texto={informe} onClose={() => setInforme(null)} />
+      </>
+    );
+  }
+
+  const gruposEmpresa = grupos.filter((g) => g.tipo !== "B2C");
+  const gruposIndividuales = grupos.filter((g) => g.tipo === "B2C");
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-5 gap-3">
+        <p className="text-sm text-[#8A8273]">Agrupados por empresa, dependencia gubernamental y huéspedes particulares.</p>
+        <button onClick={() => setInforme(generarTextoInformeTotal(grupos, consumos, contratos))} className="px-3.5 py-2 rounded-lg bg-[#2B2620] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#3E372D] transition-colors shrink-0 whitespace-nowrap"><FileText size={14} /> Informe total</button>
+      </div>
+
+      {gruposEmpresa.length > 0 && (
+        <div className="mb-6">
+          <p className="text-xs font-semibold uppercase tracking-wider text-[#8A8273] mb-2">Empresas y dependencias</p>
+          <div className="space-y-3">
+            {gruposEmpresa.map((g) => {
+              const totalGrupo = g.perfiles.reduce((s, p) => s + consumos.filter((c) => p.registros.some((r) => r.id === c.huespedId)).reduce((s2, c) => s2 + c.monto, 0), 0);
+              return (
+                <div key={g.entidad} className="bg-white rounded-xl border border-[#EDE7DA] overflow-hidden">
+                  <div className="px-4 py-3 flex items-center justify-between bg-[#FBF9F5] border-b border-[#EDE7DA]">
+                    <div className="flex items-center gap-2"><Badge tipo={g.tipo} /><span className="font-serif text-sm text-[#2B2620]">{g.entidad}</span></div>
+                    <span className="text-xs font-semibold text-[#9C6B3E]">${totalGrupo.toFixed(2)}</span>
+                  </div>
+                  <div className="divide-y divide-[#F0EBE0]">
+                    {g.perfiles.map((p) => {
+                      const dias = new Set(p.registros.flatMap((r) => diasDeRegistro(r))).size;
+                      return (
+                        <button key={p.clienteId} onClick={() => setClienteAbierto(p.clienteId)} className="w-full flex items-center justify-between px-4 py-3 hover:bg-[#FBF9F5] transition-colors text-left">
+                          <span className="text-sm text-[#3E372D]">{p.nombre}</span>
+                          <span className="text-[11px] text-[#A39C8F]">{dias} día(s) · {p.registros.length} estadía(s)</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {gruposIndividuales.length > 0 && (
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wider text-[#8A8273] mb-2">Huéspedes particulares (B2C)</p>
+          <div className="bg-white rounded-xl border border-[#EDE7DA] divide-y divide-[#F0EBE0] overflow-hidden">
+            {gruposIndividuales.map((g) => {
+              const p = g.perfiles[0];
+              const dias = new Set(p.registros.flatMap((r) => diasDeRegistro(r))).size;
+              const totalP = consumos.filter((c) => p.registros.some((r) => r.id === c.huespedId)).reduce((s, c) => s + c.monto, 0);
+              return (
+                <button key={p.clienteId} onClick={() => setClienteAbierto(p.clienteId)} className="w-full flex items-center justify-between px-4 py-3 hover:bg-[#FBF9F5] transition-colors text-left">
+                  <div><p className="text-sm text-[#3E372D]">{p.nombre}</p><p className="text-[11px] text-[#A39C8F]">{dias} día(s) · {p.registros.length} estadía(s)</p></div>
+                  <span className="text-xs font-semibold text-[#9C6B3E]">${totalP.toFixed(2)}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      <ModalInforme texto={informe} onClose={() => setInforme(null)} />
+    </div>
+  );
+}
+
+// ================= FORMULARIO CONTRATO =================
+function FormContrato({ onSave, onClose }) {
+  const [tipo, setTipo] = useState("B2B");
+  const [entidad, setEntidad] = useState("");
+  const [numero, setNumero] = useState("");
+  const [vigenciaInicio, setVigenciaInicio] = useState(HOY);
+  const [vigenciaFin, setVigenciaFin] = useState(HOY);
+  const [tarifaNoche, setTarifaNoche] = useState("");
+  const [servicios, setServicios] = useState({ Alimentacion: false, Bar: false, Minibar: false, Spa: false, Lavanderia: false });
+
+  const submit = () => {
+    if (!entidad.trim() || !numero.trim()) return;
+    onSave({ id: nuevoId("ct"), tipo, entidad: entidad.trim(), numero: numero.trim(), vigenciaInicio, vigenciaFin, tarifaNoche: parseFloat(tarifaNoche || 0), servicios, estado: "activo" });
+    onClose();
+  };
+
+  return (
+    <div>
+      <Field label="Tipo de contraparte">
+        <div className="grid grid-cols-2 gap-2">
+          {["B2B", "B2G"].map((t) => {
+            const info = TIPO_INFO[t]; const Icon = info.icon; const active = tipo === t;
+            return (
+              <button key={t} onClick={() => setTipo(t)} className="flex flex-col items-center gap-1.5 py-3 rounded-xl border-2 transition-all text-xs font-semibold" style={{ borderColor: active ? info.color : "#E8E1D4", backgroundColor: active ? info.bg : "white", color: active ? info.color : "#8A8273" }}>
+                <Icon size={18} />{info.label}
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+      <Field label={tipo === "B2B" ? "Empresa" : "Entidad / dependencia gubernamental"}>
+        <input className={inputCls} value={entidad} onChange={(e) => setEntidad(e.target.value)} placeholder={tipo === "B2B" ? "Ej. Constructora Andes S.A." : "Ej. Prefectura de Esmeraldas"} />
+      </Field>
+      <Field label="N.º de contrato / evento"><input className={inputCls} value={numero} onChange={(e) => setNumero(e.target.value)} placeholder="Ej. CT-2026-020" /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Vigencia desde"><input className={inputCls} type="date" value={vigenciaInicio} onChange={(e) => setVigenciaInicio(e.target.value)} /></Field>
+        <Field label="Vigencia hasta"><input className={inputCls} type="date" value={vigenciaFin} onChange={(e) => setVigenciaFin(e.target.value)} /></Field>
+      </div>
+      <Field label="Tarifa de alojamiento por noche (USD)" hint="Tarifa negociada para este contrato (0 si no aplica pernoctación).">
+        <input className={inputCls} type="number" step="0.01" value={tarifaNoche} onChange={(e) => setTarifaNoche(e.target.value)} placeholder="65.00" />
+      </Field>
+      <Field label="¿Qué servicios paga la empresa/entidad?" hint="Lo que no marques queda a cargo personal del huésped.">
+        <div className="grid grid-cols-2 gap-2">
+          {Object.entries(CONSUMO_INFO).filter(([k]) => k !== "Otros").map(([key, info]) => {
+            const Icon = info.icon; const active = servicios[key];
+            return (
+              <button key={key} type="button" onClick={() => setServicios((s) => ({ ...s, [key]: !s[key] }))} className="flex items-center gap-2 px-3 py-2.5 rounded-lg border-2 text-xs font-semibold transition-all" style={{ borderColor: active ? "#3E6B5C" : "#E8E1D4", backgroundColor: active ? "#EAF3EF" : "white", color: active ? "#3E6B5C" : "#8A8273" }}>
+                <Icon size={14} />{info.label}
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+      <button onClick={submit} disabled={!entidad.trim() || !numero.trim()} className="w-full mt-2 py-3 rounded-lg font-semibold text-sm text-white bg-[#2B2620] hover:bg-[#3E372D] disabled:opacity-40 transition-colors flex items-center justify-center gap-2">
+        <FileSignature size={16} /> Guardar contrato
+      </button>
+    </div>
+  );
+}
+
+// ================= VISTA CONTRATOS =================
+function VistaContratos({ contratos, setContratos }) {
+  const [modal, setModal] = useState(false);
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-5">
+        <p className="text-sm text-[#8A8273]">Define tarifas y qué servicios cubre cada empresa o dependencia.</p>
+        <button onClick={() => setModal(true)} className="px-3.5 py-2 rounded-lg bg-[#2B2620] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#3E372D] transition-colors shrink-0"><Plus size={14} /> Nuevo contrato</button>
+      </div>
+      <div className="space-y-3">
+        {contratos.map((c) => (
+          <div key={c.id} className="bg-white rounded-xl border border-[#EDE7DA] p-4">
+            <div className="flex items-start justify-between gap-3 mb-2">
+              <div><Badge tipo={c.tipo} /><p className="font-serif text-sm text-[#2B2620] mt-1.5">{c.entidad}</p><p className="text-[11px] text-[#8A8273]">{c.numero} · {c.vigenciaInicio} a {c.vigenciaFin}</p></div>
+              <p className="text-sm font-semibold text-[#9C6B3E] shrink-0">${c.tarifaNoche.toFixed(2)}/noche</p>
+            </div>
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {Object.entries(c.servicios).map(([cat, pagaEmpresa]) => (
+                <span key={cat} className="text-[10px] px-2 py-1 rounded-full font-semibold" style={{ backgroundColor: pagaEmpresa ? "#EAF3EF" : "#F0EBE0", color: pagaEmpresa ? "#3E6B5C" : "#A39C8F" }}>
+                  {CONSUMO_INFO[cat].label}: {pagaEmpresa ? "paga empresa" : "paga huésped"}
+                </span>
+              ))}
+            </div>
+          </div>
+        ))}
+        {contratos.length === 0 && <p className="text-center text-sm text-[#A39C8F] py-12">Aún no hay contratos registrados.</p>}
+      </div>
+      <Modal open={modal} onClose={() => setModal(false)} title="Nuevo contrato">
+        <FormContrato onSave={(c) => setContratos((prev) => [c, ...prev])} onClose={() => setModal(false)} />
+      </Modal>
+    </div>
+  );
+}
+
+// ================= VISTA MÉTRICAS =================
+function VistaMetricas({ huespedes, consumos, inventario }) {
+  const perfiles = useMemo(() => construirPerfiles(huespedes), [huespedes]);
+
+  const porCliente = perfiles.map((p) => {
+    const cs = consumos.filter((c) => p.registros.some((r) => r.id === c.huespedId));
+    return { nombre: p.nombre.length > 14 ? p.nombre.slice(0, 13) + "…" : p.nombre, visitas: p.registros.length, gasto: cs.reduce((s, c) => s + c.monto, 0) };
+  }).sort((a, b) => b.gasto - a.gasto).slice(0, 6);
+
+  const porCategoria = useMemo(() => {
+    const mapa = {};
+    consumos.forEach((c) => { mapa[c.categoria] = (mapa[c.categoria] || 0) + c.monto; });
+    return Object.entries(mapa).map(([cat, monto]) => ({ nombre: CONSUMO_INFO[cat]?.label || cat, monto })).sort((a, b) => b.monto - a.monto);
+  }, [consumos]);
+
+  // Segmentado por producto específico (ej. "Gaseosa Pepsi 500ml", "Cerveza Club 1.5L"...)
+  const porProducto = useMemo(() => {
+    const mapa = {};
+    consumos.forEach((c) => {
+      const nombreProd = inventario.find((p) => p.id === c.productoId)?.nombre || c.detalle;
+      if (!mapa[nombreProd]) mapa[nombreProd] = { unidades: 0, monto: 0 };
+      mapa[nombreProd].unidades += c.cantidad || 1;
+      mapa[nombreProd].monto += c.monto;
+    });
+    return Object.entries(mapa).map(([nombre, v]) => ({ nombre: nombre.length > 18 ? nombre.slice(0, 17) + "…" : nombre, ...v })).sort((a, b) => b.unidades - a.unidades).slice(0, 8);
+  }, [consumos, inventario]);
+
+  const totalGeneral = consumos.reduce((s, c) => s + c.monto, 0);
+  const pendientes = huespedes.filter((h) => h.estadoPago === "pendiente").length;
+  const productoTop = porProducto[0]?.nombre || "—";
+  const clienteFrecuente = [...perfiles].sort((a, b) => b.registros.length - a.registros.length)[0];
+
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-3 mb-6">
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-4"><p className="text-xl font-serif text-[#9C6B3E]">${totalGeneral.toFixed(2)}</p><p className="text-[11px] text-[#8A8273] mt-0.5">Consumos totales</p></div>
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-4"><p className="text-xl font-serif text-[#9C4221]">{pendientes}</p><p className="text-[11px] text-[#8A8273] mt-0.5">Pagos pendientes</p></div>
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-4"><p className="text-base font-serif text-[#2B2620] truncate">{productoTop}</p><p className="text-[11px] text-[#8A8273] mt-0.5">Producto más vendido</p></div>
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-4"><p className="text-base font-serif text-[#2B2620] truncate">{clienteFrecuente?.nombre || "—"}</p><p className="text-[11px] text-[#8A8273] mt-0.5">Cliente más frecuente</p></div>
+      </div>
+
+      <p className="text-xs font-semibold uppercase tracking-wider text-[#8A8273] mb-2 flex items-center gap-1.5"><TrendingUp size={13} /> Gasto por cliente (top 6)</p>
+      <div className="bg-white rounded-xl border border-[#EDE7DA] p-4 mb-6" style={{ height: 220 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={porCliente} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#EDE7DA" />
+            <XAxis dataKey="nombre" tick={{ fontSize: 10, fill: "#8A8273" }} />
+            <YAxis tick={{ fontSize: 10, fill: "#8A8273" }} />
+            <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid #EDE7DA" }} formatter={(v) => `$${v.toFixed(2)}`} />
+            <Bar dataKey="gasto" fill="#9C6B3E" radius={[4, 4, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      <p className="text-xs font-semibold uppercase tracking-wider text-[#8A8273] mb-2 flex items-center gap-1.5"><DollarSign size={13} /> Consumo por categoría</p>
+      <div className="bg-white rounded-xl border border-[#EDE7DA] p-4 mb-6" style={{ height: 220 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={porCategoria} layout="vertical" margin={{ top: 5, right: 20, left: 10, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#EDE7DA" />
+            <XAxis type="number" tick={{ fontSize: 10, fill: "#8A8273" }} />
+            <YAxis dataKey="nombre" type="category" tick={{ fontSize: 11, fill: "#5C5346" }} width={80} />
+            <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid #EDE7DA" }} formatter={(v) => `$${v.toFixed(2)}`} />
+            <Bar dataKey="monto" fill="#3E6B5C" radius={[0, 4, 4, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      <p className="text-xs font-semibold uppercase tracking-wider text-[#8A8273] mb-2 flex items-center gap-1.5"><Boxes size={13} /> Productos más consumidos (unidades)</p>
+      <div className="bg-white rounded-xl border border-[#EDE7DA] p-4 mb-3" style={{ height: 260 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={porProducto} layout="vertical" margin={{ top: 5, right: 20, left: 10, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#EDE7DA" />
+            <XAxis type="number" tick={{ fontSize: 10, fill: "#8A8273" }} />
+            <YAxis dataKey="nombre" type="category" tick={{ fontSize: 10, fill: "#5C5346" }} width={120} />
+            <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid #EDE7DA" }} formatter={(v, n) => n === "unidades" ? `${v} unid.` : `$${Number(v).toFixed(2)}`} />
+            <Bar dataKey="unidades" fill="#9C6B3E" radius={[0, 4, 4, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="text-[11px] text-[#A39C8F]">Útil para reponer inventario: muestra qué producto específico —gaseosa, cerveza, snack, servicio— se consume con más frecuencia.</p>
+    </div>
+  );
+}
+
+// ================= PANEL ADMIN: SOLICITUDES DE EDICIÓN =================
+function PanelSolicitudes({ solicitudes, onResolver }) {
+  const pendientes = solicitudes.filter((s) => s.estado === "pendiente");
+  if (pendientes.length === 0) return null;
+  return (
+    <div className="bg-[#FBF3E9] border border-[#E8D5B8] rounded-xl p-4 mb-5">
+      <p className="text-xs font-semibold uppercase tracking-wider text-[#9C6B3E] mb-2.5 flex items-center gap-1.5"><ShieldCheck size={13} /> Solicitudes de corrección pendientes ({pendientes.length})</p>
+      <div className="space-y-2">
+        {pendientes.map((s) => (
+          <div key={s.id} className="bg-white rounded-lg p-3 flex items-center justify-between gap-3 border border-[#EDE7DA]">
+            <div className="text-xs text-[#3E372D] min-w-0">
+              <p className="font-semibold truncate">{s.nombreHuesped}</p>
+              <p className="text-[#8A8273] truncate">{s.campo}: "{s.valorAnterior || "—"}" → "{s.valorNuevo}"</p>
+            </div>
+            <div className="flex gap-1.5 shrink-0">
+              <button onClick={() => onResolver(s.id, "aprobado")} className="px-2.5 py-1.5 rounded-md bg-[#3E8E5F] text-white text-[11px] font-semibold">Aprobar</button>
+              <button onClick={() => onResolver(s.id, "rechazado")} className="px-2.5 py-1.5 rounded-md bg-[#F0EBE0] text-[#8A8273] text-[11px] font-semibold">Rechazar</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ================= VISTA RECEPCIÓN =================
+function VistaRecepcion({ huespedes, consumos, contratos, inventario, setHuespedes, setConsumos, solicitudes, onResolverSolicitud }) {
+  const [filtro, setFiltro] = useState("Todos");
+  const [busqueda, setBusqueda] = useState("");
+  const [modalCheckIn, setModalCheckIn] = useState(false);
+  const [modalConsumo, setModalConsumo] = useState(null);
+  const [modalLink, setModalLink] = useState(false);
+  const [expandido, setExpandido] = useState(null);
+
+  const huespedesFiltrados = useMemo(() => huespedes.filter((h) => {
+    if (filtro !== "Todos" && h.tipo !== filtro) return false;
+    if (busqueda && !h.nombre.toLowerCase().includes(busqueda.toLowerCase()) && !(h.entidad || "").toLowerCase().includes(busqueda.toLowerCase())) return false;
+    return true;
+  }), [huespedes, filtro, busqueda]);
+
+  const consumosDe = (huespedId) => consumos.filter((c) => c.huespedId === huespedId);
+  const totalDe = (huespedId) => consumosDe(huespedId).reduce((s, c) => s + c.monto, 0);
+  const hacerCheckOut = (id) => setHuespedes((prev) => prev.map((h) => (h.id === id ? { ...h, estado: "checkout", checkOut: HOY } : h)));
+  const togglePago = (id) => setHuespedes((prev) => prev.map((h) => (h.id === id ? { ...h, estadoPago: h.estadoPago === "pagado" ? "pendiente" : "pagado" } : h)));
+
+  const activos = huespedes.filter((h) => h.estado === "activo").length;
+  const totalConsumosHoy = consumos.filter((c) => c.fecha === HOY).reduce((s, c) => s + c.monto, 0);
+  const totalAdeudadoGeneral = huespedes.filter((h) => h.estadoPago !== "pagado").reduce((s, h) => {
+    const hosp = diasDeRegistro(h).length * (h.tarifaNoche || 0);
+    const cons = totalDe(h.id);
+    return s + hosp + cons;
+  }, 0);
+  const linkPreRegistro = "https://tuhotel.com/pre-registro";
+
+  return (
+    <div>
+      <PanelSolicitudes solicitudes={solicitudes} onResolver={onResolverSolicitud} />
+
+      <div className="grid grid-cols-2 gap-3 mb-6">
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-4"><p className="text-2xl font-serif text-[#2B2620]">{activos}</p><p className="text-xs text-[#8A8273] mt-0.5">Huéspedes activos</p></div>
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-4"><p className="text-2xl font-serif text-[#2B2620]">{huespedes.length}</p><p className="text-xs text-[#8A8273] mt-0.5">Registros totales</p></div>
+        <div className="bg-white rounded-xl border border-[#EDE7DA] p-4"><p className="text-2xl font-serif text-[#9C6B3E]">${totalConsumosHoy.toFixed(2)}</p><p className="text-xs text-[#8A8273] mt-0.5">Consumos de hoy</p></div>
+        <div className="bg-[#2B2620] rounded-xl p-4"><p className="text-2xl font-serif text-white">${totalAdeudadoGeneral.toFixed(2)}</p><p className="text-xs text-[#C2B9A6] mt-0.5">Total adeudado (hosp. + cons.)</p></div>
+      </div>
+
+      <div className="flex flex-col sm:flex-row gap-3 mb-4">
+        <div className="relative flex-1">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A39C8F]" />
+          <input className={inputCls + " pl-9"} placeholder="Buscar huésped o empresa..." value={busqueda} onChange={(e) => setBusqueda(e.target.value)} />
+        </div>
+        <button onClick={() => setModalLink(true)} className="px-3.5 py-2.5 rounded-lg border border-[#DCD4C3] bg-white text-xs font-semibold text-[#5C5346] flex items-center justify-center gap-1.5 hover:bg-[#F0EBE0] transition-colors whitespace-nowrap"><Link2 size={14} /> Link de pre-registro</button>
+        <button onClick={() => setModalCheckIn(true)} className="px-4 py-2.5 rounded-lg bg-[#2B2620] text-white text-sm font-semibold flex items-center justify-center gap-2 hover:bg-[#3E372D] transition-colors whitespace-nowrap"><LogIn size={16} /> Nuevo check-in</button>
+      </div>
+
+      <div className="flex gap-2 mb-5 overflow-x-auto pb-1">
+        {["Todos", "B2C", "B2B", "B2G"].map((t) => (
+          <button key={t} onClick={() => setFiltro(t)} className="px-3.5 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all" style={{ backgroundColor: filtro === t ? "#2B2620" : "#F0EBE0", color: filtro === t ? "white" : "#6B6358" }}>
+            {t === "Todos" ? "Todos" : TIPO_INFO[t].label}
+          </button>
+        ))}
+      </div>
+
+      <div className="space-y-3">
+        {huespedesFiltrados.length === 0 && <div className="text-center py-12 text-[#A39C8F] text-sm">No hay registros que coincidan con la búsqueda.</div>}
+        {huespedesFiltrados.map((h) => {
+          const cs = consumosDe(h.id);
+          const totalConsumos = totalDe(h.id);
+          const diasH = diasDeRegistro(h).length;
+          const totalHospedaje = diasH * (h.tarifaNoche || 0);
+          const totalGeneral = totalHospedaje + totalConsumos;
+          const open = expandido === h.id;
+          return (
+            <div key={h.id} className="bg-white rounded-xl border border-[#EDE7DA] overflow-hidden">
+              <div className="p-4 flex items-start justify-between gap-3 cursor-pointer" onClick={() => setExpandido(open ? null : h.id)}>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap mb-1.5"><Badge tipo={h.tipo} /><EstadoPill estado={h.estado} /><PagoPill estado={h.estadoPago} onClick={(e) => { e?.stopPropagation?.(); togglePago(h.id); }} /></div>
+                  <p className="font-serif text-base text-[#2B2620] truncate">{h.nombre}</p>
+                  <p className="text-xs text-[#8A8273] mt-0.5">Hab./Espacio {h.habitacion} · Doc. {h.doc}{h.entidad && <> · {h.entidad}</>}</p>
+                  <p className="text-xs text-[#A39C8F] mt-1 flex items-center gap-1"><Clock size={11} /> Entrada {h.checkIn}{h.checkOut && <> · Salida {h.checkOut}</>}</p>
+                </div>
+                <div className="text-right shrink-0">
+                  <p className="text-sm font-semibold text-[#9C6B3E]">${totalGeneral.toFixed(2)}</p>
+                  <p className="text-[10px] text-[#A39C8F]">hosp. ${totalHospedaje.toFixed(2)} + cons. ${totalConsumos.toFixed(2)}</p>
+                </div>
+              </div>
+              {open && (
+                <div className="border-t border-[#EDE7DA] bg-[#FBF9F5] p-4">
+                  <div className="flex items-center justify-between text-xs bg-white rounded-lg px-3 py-2 border border-[#EDE7DA] mb-1.5">
+                    <span className="flex items-center gap-2 text-[#5C5346]"><LogIn size={13} className="text-[#9C6B3E]" /> Hospedaje · {diasH} día(s) × ${(h.tarifaNoche || 0).toFixed(2)}</span>
+                    <span className="font-semibold text-[#2B2620]">${totalHospedaje.toFixed(2)}</span>
+                  </div>
+                  {cs.length > 0 && (
+                    <div className="space-y-1.5 mb-3">
+                      {cs.map((c) => {
+                        const Icon = CONSUMO_INFO[c.categoria].icon;
+                        return (
+                          <div key={c.id} className="flex items-center justify-between text-xs bg-white rounded-lg px-3 py-2 border border-[#EDE7DA]">
+                            <span className="flex items-center gap-2 text-[#5C5346]"><Icon size={13} className="text-[#9C6B3E]" /> {c.detalle}</span>
+                            <span className="font-semibold text-[#2B2620]">${c.monto.toFixed(2)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between text-xs bg-[#2B2620] rounded-lg px-3 py-2 mb-3">
+                    <span className="font-semibold text-[#C2B9A6] uppercase tracking-wide">Total adeudado</span>
+                    <span className="font-serif text-white">${totalGeneral.toFixed(2)}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={(e) => { e.stopPropagation(); setModalConsumo(h.id); }} className="flex-1 py-2 rounded-lg border border-[#DCD4C3] text-xs font-semibold text-[#5C5346] hover:bg-white transition-colors flex items-center justify-center gap-1.5"><Plus size={13} /> Agregar consumo</button>
+                    {h.estado === "activo" && (<button onClick={(e) => { e.stopPropagation(); hacerCheckOut(h.id); }} className="flex-1 py-2 rounded-lg bg-[#2B2620] text-white text-xs font-semibold hover:bg-[#3E372D] transition-colors flex items-center justify-center gap-1.5"><LogOut size={13} /> Check-out</button>)}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <Modal open={modalCheckIn} onClose={() => setModalCheckIn(false)} title="Nuevo check-in">
+        <FormCheckIn onSave={(h) => setHuespedes((prev) => [h, ...prev])} onClose={() => setModalCheckIn(false)} contratos={contratos} />
+      </Modal>
+      <Modal open={!!modalConsumo} onClose={() => setModalConsumo(null)} title="Registrar consumo">
+        <FormConsumo huespedes={huespedes.filter((h) => h.estado === "activo")} contratos={contratos} inventario={inventario} huespedPreseleccionado={modalConsumo} onSave={(c) => setConsumos((prev) => [c, ...prev])} onClose={() => setModalConsumo(null)} />
+      </Modal>
+      <Modal open={modalLink} onClose={() => setModalLink(false)} title="Link de pre-registro para el cliente">
+        <p className="text-xs text-[#8A8273] mb-3 leading-relaxed">Comparte este enlace con el huésped antes de su llegada. Al completarlo, el registro queda listo en recepción — solo falta confirmar el check-in. La salida siempre se registra manualmente desde recepción.</p>
+        <div className="flex items-center gap-2 bg-[#FBF9F5] border border-[#EDE7DA] rounded-lg px-3 py-2.5 mb-3">
+          <code className="text-xs text-[#5C5346] flex-1 truncate">{linkPreRegistro}</code>
+          <button onClick={() => navigator.clipboard?.writeText(linkPreRegistro)} className="text-[11px] font-semibold text-[#9C6B3E] shrink-0">Copiar</button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ================= VISTA AUTO-REGISTRO CLIENTE =================
+function VistaCliente({ onEnviar }) {
+  const [enviado, setEnviado] = useState(false);
+  const [tipo, setTipo] = useState("B2C");
+  const [nombre, setNombre] = useState("");
+  const [doc, setDoc] = useState("");
+  const [telefono, setTelefono] = useState("");
+  const [entidad, setEntidad] = useState("");
+  const [contrato, setContrato] = useState("");
+  const [email, setEmail] = useState("");
+
+  const submit = () => {
+    if (!nombre.trim() || !doc.trim()) return;
+    onEnviar({ id: nuevoId("h"), tipo, nombre: nombre.trim(), doc: doc.trim(), telefono: telefono.trim(), email: email.trim(), habitacion: "Por asignar", checkIn: HOY, checkOut: null, estado: "activo", entidad: tipo === "B2C" ? null : entidad.trim(), contratoId: null, contratoTexto: tipo === "B2C" ? null : contrato.trim(), tarifaNoche: 0, estadoPago: "pendiente" });
+    setEnviado(true);
+  };
+
+  if (enviado) {
+    return (
+      <div className="max-w-md mx-auto text-center py-16 px-6">
+        <div className="w-14 h-14 rounded-full bg-[#E3F1E8] flex items-center justify-center mx-auto mb-4"><Check size={26} className="text-[#3E8E5F]" /></div>
+        <h2 className="font-serif text-xl text-[#2B2620] mb-2">Pre-registro recibido</h2>
+        <p className="text-sm text-[#8A8273] leading-relaxed">Gracias, {nombre.split(" ")[0]}. Tu información quedó lista en recepción — solo confirma tu identidad al llegar para completar el check-in.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-md mx-auto">
+      <div className="text-center mb-7">
+        <h2 className="font-serif text-2xl text-[#2B2620] mb-1.5">Pre-registro de llegada</h2>
+        <p className="text-sm text-[#8A8273]">Completa tus datos antes de llegar para agilizar tu check-in.</p>
+      </div>
+
+      <CapturaCedulaOCR onDatos={(d) => { if (d.nombreCompleto) setNombre(d.nombreCompleto); if (d.cedula) setDoc(d.cedula); }} />
+
+      <Field label="¿Cómo nos visitas?">
+        <div className="grid grid-cols-3 gap-2">
+          {Object.entries(TIPO_INFO).map(([key, info]) => {
+            const Icon = info.icon; const active = tipo === key;
+            return (<button key={key} onClick={() => setTipo(key)} className="flex flex-col items-center gap-1.5 py-3 rounded-xl border-2 transition-all text-xs font-semibold" style={{ borderColor: active ? info.color : "#E8E1D4", backgroundColor: active ? info.bg : "white", color: active ? info.color : "#8A8273" }}><Icon size={18} />{info.label}</button>);
+          })}
+        </div>
+      </Field>
+
+      <Field label="Nombre completo"><input className={inputCls} value={nombre} onChange={(e) => setNombre(e.target.value)} placeholder="Tu nombre completo" /></Field>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Documento / ID"><input className={inputCls} value={doc} onChange={(e) => setDoc(e.target.value)} placeholder="Cédula / pasaporte" /></Field>
+        <Field label="Teléfono"><input className={inputCls} value={telefono} onChange={(e) => setTelefono(e.target.value)} placeholder="09XXXXXXXX" /></Field>
+      </div>
+      <Field label="Correo electrónico"><input className={inputCls} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="tu@correo.com" /></Field>
+
+      {tipo !== "B2C" && (
+        <>
+          <Field label={tipo === "B2B" ? "Empresa" : "Entidad / institución"}><input className={inputCls} value={entidad} onChange={(e) => setEntidad(e.target.value)} placeholder={tipo === "B2B" ? "Nombre de tu empresa" : "Nombre de la entidad"} /></Field>
+          <Field label="N.º de contrato (si aplica)"><input className={inputCls} value={contrato} onChange={(e) => setContrato(e.target.value)} placeholder="Proporcionado por tu organización" /></Field>
+        </>
+      )}
+
+      <button onClick={submit} disabled={!nombre.trim() || !doc.trim()} className="w-full mt-2 py-3 rounded-lg font-semibold text-sm text-white bg-[#2B2620] hover:bg-[#3E372D] disabled:opacity-40 transition-colors">Enviar pre-registro</button>
+      <p className="text-[11px] text-center text-[#A39C8F] mt-3">Tus datos se usan únicamente para tu estadía y se manejan de forma confidencial. La salida se confirma siempre en recepción.</p>
+    </div>
+  );
+}
+
+// ================= FORMULARIO INVITADO (DATOS COMPLETOS DE CÉDULA) =================
+function FormInvitado({ contratos, onSave, onClose, origen = "preregistrado" }) {
+  const [eventoId, setEventoId] = useState(contratos[0]?.id || "");
+  const [nombres, setNombres] = useState("");
+  const [apellidos, setApellidos] = useState("");
+  const [cedula, setCedula] = useState("");
+  const [numeroDocumento, setNumeroDocumento] = useState("");
+  const [nacionalidad, setNacionalidad] = useState("ECUATORIANA");
+  const [fechaNacimiento, setFechaNacimiento] = useState("");
+  const [fechaVencimiento, setFechaVencimiento] = useState("");
+  const [sexo, setSexo] = useState("");
+  const [estadoCivil, setEstadoCivil] = useState("");
+  const [lugarNacimiento, setLugarNacimiento] = useState("");
+  const [nombrePadre, setNombrePadre] = useState("");
+  const [nombreMadre, setNombreMadre] = useState("");
+  const [tipoSangre, setTipoSangre] = useState("");
+  const [donante, setDonante] = useState("");
+  const [lugarFechaEmision, setLugarFechaEmision] = useState("");
+  const [telefono, setTelefono] = useState("");
+  const [email, setEmail] = useState("");
+  const [observaciones, setObservaciones] = useState("");
+  const [fotoCedula, setFotoCedula] = useState(null);
+  const [leidoPorMRZ, setLeidoPorMRZ] = useState(false);
+  const [quienPagaInvitado, setQuienPagaInvitado] = useState("organizador");
+
+  const submit = () => {
+    if (!nombres.trim() || !apellidos.trim() || !cedula.trim()) return;
+    onSave({
+      id: nuevoId("i"), eventoId: eventoId || null, nombres: nombres.trim().toUpperCase(), apellidos: apellidos.trim().toUpperCase(),
+      cedula: cedula.trim(), numeroDocumento: numeroDocumento.trim(), nacionalidad: nacionalidad.trim(),
+      fechaNacimiento, fechaVencimiento, sexo, estadoCivil, lugarNacimiento: lugarNacimiento.trim(),
+      nombrePadre: nombrePadre.trim(), nombreMadre: nombreMadre.trim(), tipoSangre, donante,
+      lugarFechaEmision: lugarFechaEmision.trim(), telefono: telefono.trim(), email: email.trim(),
+      fotoCedula, fechaAsistencia: HOY, observaciones: observaciones.trim(), origen,
+      quienPagaInvitado, estadoPagoInvitado: "pendiente",
+      asistenciaConfirmada: origen === "walkin", horaConfirmacion: origen === "walkin" ? new Date().toISOString() : null,
+      fotoVerificacion: origen === "walkin" ? fotoCedula : null, cedulaVerificacionCoincide: null, verificacionManual: origen === "walkin",
+    });
+    onClose();
+  };
+
+  return (
+    <div>
+      {origen === "walkin" && (
+        <div className="mb-4 p-3 rounded-lg bg-[#FBF3E9] border border-[#E8D9C4] text-xs text-[#9C6B3E] flex items-start gap-2">
+          <AlertCircle size={14} className="shrink-0 mt-0.5" />
+          Esta persona no estaba en la lista pre-registrada. Quedará marcada como "no listado" para trazabilidad y su asistencia se da por confirmada al registrarla aquí.
+        </div>
+      )}
+      <CapturaCedulaOCR onDatos={(d) => {
+        if (d.nombres) setNombres(d.nombres);
+        if (d.apellidos) setApellidos(d.apellidos);
+        if (d.cedula) setCedula(d.cedula);
+        if (d.numeroDocumento) setNumeroDocumento(d.numeroDocumento);
+        if (d.nacionalidad) setNacionalidad(d.nacionalidad === "ECU" ? "ECUATORIANA" : d.nacionalidad);
+        if (d.fechaNacimiento) setFechaNacimiento(d.fechaNacimiento);
+        if (d.fechaVencimiento) setFechaVencimiento(d.fechaVencimiento);
+        if (d.sexo) setSexo(d.sexo);
+        if (d.estadoCivil) setEstadoCivil(d.estadoCivil);
+        if (d.lugarNacimiento) setLugarNacimiento(d.lugarNacimiento);
+        if (d.nombrePadre) setNombrePadre(d.nombrePadre);
+        if (d.nombreMadre) setNombreMadre(d.nombreMadre);
+        if (d.tipoSangre) setTipoSangre(d.tipoSangre);
+        if (d.donante) setDonante(d.donante);
+        if (d.lugarFechaEmision) setLugarFechaEmision(d.lugarFechaEmision);
+        if (d.fotoCedula) setFotoCedula(d.fotoCedula);
+        setLeidoPorMRZ(!!d.leidoPorMRZ);
+      }} />
+
+      <Field label="Evento / contrato">
+        <select className={inputCls} value={eventoId} onChange={(e) => setEventoId(e.target.value)}>
+          <option value="">Sin evento asignado</option>
+          {contratos.map((c) => <option key={c.id} value={c.id}>{c.entidad} — {c.numero}</option>)}
+        </select>
+      </Field>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Apellidos"><input className={inputCls} value={apellidos} onChange={(e) => setApellidos(e.target.value)} placeholder="RAMÍREZ TORRES" /></Field>
+        <Field label="Nombres"><input className={inputCls} value={nombres} onChange={(e) => setNombres(e.target.value)} placeholder="PEDRO ANDRÉS" /></Field>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Cédula (NUI)" hint={leidoPorMRZ ? "Leído del MRZ" : undefined}><input className={inputCls} value={cedula} onChange={(e) => setCedula(e.target.value)} placeholder="10 dígitos" /></Field>
+        <Field label="N.º de documento"><input className={inputCls} value={numeroDocumento} onChange={(e) => setNumeroDocumento(e.target.value)} placeholder="9 dígitos" /></Field>
+      </div>
+
+      <Field label="Nacionalidad"><input className={inputCls} value={nacionalidad} onChange={(e) => setNacionalidad(e.target.value)} placeholder="ECUATORIANA" /></Field>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Fecha de nacimiento"><input className={inputCls} value={fechaNacimiento} onChange={(e) => setFechaNacimiento(e.target.value)} placeholder="DD/MM/AAAA" /></Field>
+        <Field label="Fecha de vencimiento"><input className={inputCls} value={fechaVencimiento} onChange={(e) => setFechaVencimiento(e.target.value)} placeholder="DD/MM/AAAA" /></Field>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Sexo">
+          <select className={inputCls} value={sexo} onChange={(e) => setSexo(e.target.value)}>
+            <option value="">—</option><option value="M">Masculino</option><option value="F">Femenino</option>
+          </select>
+        </Field>
+        <Field label="Estado civil">
+          <select className={inputCls} value={estadoCivil} onChange={(e) => setEstadoCivil(e.target.value)}>
+            <option value="">—</option><option>SOLTERO/A</option><option>CASADO/A</option><option>DIVORCIADO/A</option><option>VIUDO/A</option><option>UNIÓN LIBRE</option>
+          </select>
+        </Field>
+      </div>
+
+      <Field label="Lugar de nacimiento"><input className={inputCls} value={lugarNacimiento} onChange={(e) => setLugarNacimiento(e.target.value)} placeholder="Ciudad" /></Field>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Nombre del padre"><input className={inputCls} value={nombrePadre} onChange={(e) => setNombrePadre(e.target.value)} placeholder="Opcional" /></Field>
+        <Field label="Nombre de la madre"><input className={inputCls} value={nombreMadre} onChange={(e) => setNombreMadre(e.target.value)} placeholder="Opcional" /></Field>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Tipo de sangre"><input className={inputCls} value={tipoSangre} onChange={(e) => setTipoSangre(e.target.value)} placeholder="Ej. O+" /></Field>
+        <Field label="Donante">
+          <select className={inputCls} value={donante} onChange={(e) => setDonante(e.target.value)}>
+            <option value="">—</option><option value="SI">Sí</option><option value="NO">No</option>
+          </select>
+        </Field>
+      </div>
+
+      <Field label="Lugar y fecha de emisión"><input className={inputCls} value={lugarFechaEmision} onChange={(e) => setLugarFechaEmision(e.target.value)} placeholder="Ej. QUITO 16 ENE 2024" /></Field>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Teléfono"><input className={inputCls} value={telefono} onChange={(e) => setTelefono(e.target.value)} placeholder="09XXXXXXXX" /></Field>
+        <Field label="Correo electrónico"><input className={inputCls} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="correo@ejemplo.com" /></Field>
+      </div>
+
+      <Field label="Observaciones"><textarea className={inputCls} rows={2} value={observaciones} onChange={(e) => setObservaciones(e.target.value)} placeholder="Notas (opcional)" /></Field>
+
+      <button onClick={submit} disabled={!nombres.trim() || !apellidos.trim() || !cedula.trim()} className="w-full mt-2 py-3 rounded-lg font-semibold text-sm text-white bg-[#2B2620] hover:bg-[#3E372D] disabled:opacity-40 transition-colors flex items-center justify-center gap-2">
+        <Users size={16} /> Registrar invitado
+      </button>
+    </div>
+  );
+}
+
+// ================= CONFIRMACIÓN DE ASISTENCIA (verificación cruzada por OCR) =================
+// En la puerta del evento se vuelve a fotografiar la cédula; se lee por OCR/MRZ y se compara
+// el número de cédula contra el del invitado pre-registrado. Si coincide, se confirma asistencia
+// automáticamente. Si no coincide (persona equivocada, foto de otra cédula), se avisa y permite
+// al recepcionista decidir manualmente.
+function ModalConfirmarAsistencia({ invitado, onConfirmar, onClose }) {
+  const [resultado, setResultado] = useState(null); // null | {coincide, cedulaLeida, fotoVerificacion, nombreLeido}
+  const [leyendo, setLeyendo] = useState(false);
+
+  if (!invitado) return null;
+
+  const manejarFoto = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLeyendo(true);
+    setResultado(null);
+    const dataUrl = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.readAsDataURL(file);
+    });
+    try {
+      const Tesseract = await cargarTesseract();
+      const { data } = await Tesseract.recognize(dataUrl, "spa");
+      const campos = parseCedulaTexto(data.text || "");
+      const coincide = !!campos.cedula && campos.cedula === invitado.cedula;
+      setResultado({ coincide, cedulaLeida: campos.cedula, fotoVerificacion: dataUrl, nombreLeido: campos.nombreCompleto, leidoPorMRZ: campos.leidoPorMRZ });
+    } catch (err) {
+      setResultado({ coincide: false, cedulaLeida: "", fotoVerificacion: dataUrl, error: true });
+    } finally {
+      setLeyendo(false);
+    }
+  };
+
+  const confirmarManual = () => {
+    onConfirmar(invitado.id, { fotoVerificacion: resultado?.fotoVerificacion || null, cedulaLeida: resultado?.cedulaLeida || "", coincidio: resultado?.coincide || false, verificacionManual: !resultado?.coincide });
+    onClose();
+  };
+
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-4 p-3 rounded-lg bg-[#FBF9F5] border border-[#EDE7DA]">
+        {invitado.fotoCedula ? <img src={invitado.fotoCedula} alt="" className="w-12 h-12 rounded-lg object-cover border border-[#EDE7DA]" /> : <div className="w-12 h-12 rounded-lg bg-[#F0EBE0] flex items-center justify-center text-[#A39C8F]"><ImageIcon size={16} /></div>}
+        <div>
+          <p className="text-sm font-serif text-[#2B2620]">{invitado.apellidos} {invitado.nombres}</p>
+          <p className="text-xs text-[#8A8273]">Cédula registrada: {invitado.cedula}</p>
+        </div>
+      </div>
+
+      <p className="text-xs text-[#8A8273] mb-3 leading-relaxed">Toma una foto de la cédula de la persona en la entrada. El sistema la lee por OCR/MRZ y la compara automáticamente con el registro.</p>
+
+      <label className="w-full flex items-center justify-center gap-2 py-3 rounded-lg border-2 border-dashed border-[#DCD4C3] text-sm font-semibold text-[#5C5346] cursor-pointer hover:bg-[#FBF9F5] transition-colors mb-4">
+        <ScanLine size={16} /> {leyendo ? "Leyendo cédula..." : "Fotografiar cédula para verificar"}
+        <input type="file" accept="image/*" capture="environment" className="hidden" onChange={manejarFoto} disabled={leyendo} />
+      </label>
+
+      {resultado && (
+        <div className="rounded-lg p-3.5 mb-4 flex items-start gap-2.5" style={{ backgroundColor: resultado.coincide ? "#E3F1E8" : "#FBEAE3" }}>
+          {resultado.coincide ? <CheckCircle2 size={18} className="text-[#2E5A45] shrink-0 mt-0.5" /> : <AlertCircle size={18} className="text-[#9C4221] shrink-0 mt-0.5" />}
+          <div className="text-xs">
+            <p className="font-semibold" style={{ color: resultado.coincide ? "#2E5A45" : "#9C4221" }}>
+              {resultado.coincide ? "Cédula coincide — identidad verificada" : resultado.cedulaLeida ? "La cédula leída no coincide con el registro" : "No se pudo leer la cédula"}
+            </p>
+            {resultado.cedulaLeida && <p className="text-[#6B6358] mt-1">Cédula leída: {resultado.cedulaLeida}{resultado.nombreLeido && <> · {resultado.nombreLeido}</>}{resultado.leidoPorMRZ && " · vía MRZ"}</p>}
+            {!resultado.coincide && <p className="text-[#6B6358] mt-1">Verifica manualmente antes de confirmar la asistencia.</p>}
+          </div>
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <button onClick={onClose} className="flex-1 py-2.5 rounded-lg border border-[#DCD4C3] text-xs font-semibold text-[#5C5346] hover:bg-[#F7F4EE] transition-colors">Cancelar</button>
+        <button
+          onClick={confirmarManual}
+          disabled={!resultado}
+          className="flex-1 py-2.5 rounded-lg text-white text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40"
+          style={{ backgroundColor: resultado?.coincide ? "#2E5A45" : "#9C4221" }}
+        >
+          <CheckCircle2 size={14} /> {resultado?.coincide ? "Confirmar asistencia" : "Confirmar de todos modos"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ================= VISTA INVITADOS A EVENTOS =================
+function VistaInvitados({ invitados, setInvitados, contratos }) {
+  const [modalAbierto, setModalAbierto] = useState(false);
+  const [invitadoVerificar, setInvitadoVerificar] = useState(null);
+  const [eventoFiltro, setEventoFiltro] = useState("Todos");
+  const [asistenciaFiltro, setAsistenciaFiltro] = useState("Todos");
+  const [busqueda, setBusqueda] = useState("");
+
+  const eventos = contratos.filter((c) => c.tipo === "B2G" || c.tipo === "B2B");
+
+  const confirmarAsistencia = (invitadoId, datos) => {
+    setInvitados((prev) => prev.map((i) => (i.id === invitadoId ? {
+      ...i, asistenciaConfirmada: true, horaConfirmacion: new Date().toISOString(),
+      fotoVerificacion: datos.fotoVerificacion, cedulaVerificacionCoincide: datos.coincidio,
+      verificacionManual: datos.verificacionManual,
+    } : i)));
+  };
+
+  const filtrados = invitados.filter((i) => {
+    if (eventoFiltro !== "Todos" && i.eventoId !== eventoFiltro) return false;
+    if (asistenciaFiltro === "Confirmados" && !i.asistenciaConfirmada) return false;
+    if (asistenciaFiltro === "Pendientes" && i.asistenciaConfirmada) return false;
+    const texto = `${i.nombres} ${i.apellidos} ${i.cedula}`.toLowerCase();
+    if (busqueda && !texto.includes(busqueda.toLowerCase())) return false;
+    return true;
+  });
+
+  const nombreEvento = (id) => {
+    const c = contratos.find((c) => c.id === id);
+    return c ? `${c.entidad} — ${c.numero}` : "Sin evento asignado";
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4 gap-3">
+        <p className="text-sm text-[#8A8273]">Lista de invitados registrados por evento o contrato, con datos completos de cédula.</p>
+        <button onClick={() => setModalAbierto(true)} className="px-3.5 py-2 rounded-lg bg-[#2B2620] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#3E372D] transition-colors shrink-0 whitespace-nowrap">
+          <Plus size={14} /> Nuevo invitado
+        </button>
+      </div>
+
+      <div className="flex flex-col sm:flex-row gap-3 mb-4">
+        <div className="relative flex-1">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A39C8F]" />
+          <input className={inputCls + " pl-9"} placeholder="Buscar por nombre o cédula..." value={busqueda} onChange={(e) => setBusqueda(e.target.value)} />
+        </div>
+      </div>
+
+      <div className="flex gap-2 mb-5 overflow-x-auto pb-1">
+        <button onClick={() => setEventoFiltro("Todos")} className="px-3.5 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all" style={{ backgroundColor: eventoFiltro === "Todos" ? "#2B2620" : "#F0EBE0", color: eventoFiltro === "Todos" ? "white" : "#6B6358" }}>Todos</button>
+        {eventos.map((e) => (
+          <button key={e.id} onClick={() => setEventoFiltro(e.id)} className="px-3.5 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all" style={{ backgroundColor: eventoFiltro === e.id ? "#2B2620" : "#F0EBE0", color: eventoFiltro === e.id ? "white" : "#6B6358" }}>
+            {e.entidad}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex gap-2 mb-5">
+        {["Todos", "Confirmados", "Pendientes"].map((f) => (
+          <button key={f} onClick={() => setAsistenciaFiltro(f)} className="px-3.5 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all" style={{ backgroundColor: asistenciaFiltro === f ? "#2B2620" : "#F0EBE0", color: asistenciaFiltro === f ? "white" : "#6B6358" }}>
+            {f}
+          </button>
+        ))}
+      </div>
+
+      <div className="space-y-3">
+        {filtrados.length === 0 && <div className="text-center py-12 text-[#A39C8F] text-sm">No hay invitados que coincidan.</div>}
+        {filtrados.map((i) => (
+          <div key={i.id} className="bg-white rounded-xl border border-[#EDE7DA] p-4">
+            <div className="flex gap-3">
+              {i.fotoCedula ? (
+                <img src={i.fotoCedula} alt="Cédula" className="w-14 h-14 rounded-lg object-cover border border-[#EDE7DA] shrink-0" />
+              ) : (
+                <div className="w-14 h-14 rounded-lg bg-[#F0EBE0] flex items-center justify-center shrink-0 text-[#A39C8F]"><ImageIcon size={18} /></div>
+              )}
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                  <p className="font-serif text-sm text-[#2B2620]">{i.apellidos} {i.nombres}</p>
+                  {i.asistenciaConfirmada ? (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold" style={{ color: i.cedulaVerificacionCoincide ? "#2E5A45" : "#9C4221", backgroundColor: i.cedulaVerificacionCoincide ? "#E3F1E8" : "#FBEAE3" }}>
+                      <CheckCircle2 size={10} /> {i.cedulaVerificacionCoincide ? "Asistencia verificada" : "Confirmado (manual)"}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold text-[#9C6B3E] bg-[#FBF3E9]">
+                      <Clock size={10} /> Pendiente de confirmar
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-[#8A8273] mt-0.5">Cédula {i.cedula}{i.sexo && <> · {i.sexo === "M" ? "Masculino" : "Femenino"}</>}{i.fechaNacimiento && <> · Nac. {i.fechaNacimiento}</>}</p>
+                <p className="text-[11px] text-[#A39C8F] mt-1">{nombreEvento(i.eventoId)} · Pre-registrado el {i.fechaAsistencia}</p>
+                {i.horaConfirmacion && <p className="text-[11px] text-[#2E5A45] mt-0.5">Asistencia confirmada {new Date(i.horaConfirmacion).toLocaleString("es-EC")}</p>}
+                {i.observaciones && <p className="text-[11px] text-[#9C6B3E] mt-1 italic">{i.observaciones}</p>}
+              </div>
+            </div>
+            {!i.asistenciaConfirmada && (
+              <button onClick={() => setInvitadoVerificar(i)} className="w-full mt-3 py-2 rounded-lg border border-[#DCD4C3] text-xs font-semibold text-[#5C5346] hover:bg-[#FBF9F5] transition-colors flex items-center justify-center gap-1.5">
+                <ScanLine size={13} /> Confirmar asistencia (verificar con cédula)
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <Modal open={modalAbierto} onClose={() => setModalAbierto(false)} title="Registrar invitado a evento">
+        <FormInvitado contratos={eventos} onSave={(i) => setInvitados((prev) => [i, ...prev])} onClose={() => setModalAbierto(false)} />
+      </Modal>
+
+      <Modal open={!!invitadoVerificar} onClose={() => setInvitadoVerificar(null)} title="Verificar asistencia">
+        <ModalConfirmarAsistencia invitado={invitadoVerificar} onConfirmar={confirmarAsistencia} onClose={() => setInvitadoVerificar(null)} />
+      </Modal>
+    </div>
+  );
+}
+
+
+// ================= VISTA INVENTARIO (PRODUCTOS, PLATOS, SERVICIOS) =================
+function FormProducto({ onSave, onClose, inicial }) {
+  const [nombre, setNombre] = useState(inicial?.nombre || "");
+  const [categoria, setCategoria] = useState(inicial?.categoria || "Bar");
+  const [tipo, setTipo] = useState(inicial?.tipo || "producto");
+  const [precio, setPrecio] = useState(inicial?.precio ?? "");
+  const [stock, setStock] = useState(inicial?.stock ?? "");
+  const [unidad, setUnidad] = useState(inicial?.unidad || "");
+
+  const submit = () => {
+    if (!nombre.trim() || !precio) return;
+    onSave({
+      id: inicial?.id || nuevoId("p"), nombre: nombre.trim(), categoria, tipo,
+      precio: parseFloat(precio), stock: tipo === "producto" ? (stock === "" ? null : parseInt(stock)) : null,
+      unidad: unidad.trim(),
+    });
+    onClose();
+  };
+
+  return (
+    <div>
+      <Field label="Nombre"><input className={inputCls} value={nombre} onChange={(e) => setNombre(e.target.value)} placeholder="Ej. Gaseosa Pepsi 500ml" /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Categoría">
+          <select className={inputCls} value={categoria} onChange={(e) => setCategoria(e.target.value)}>
+            {Object.entries(CONSUMO_INFO).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+          </select>
+        </Field>
+        <Field label="Tipo">
+          <select className={inputCls} value={tipo} onChange={(e) => setTipo(e.target.value)}>
+            <option value="producto">Producto (con stock)</option>
+            <option value="plato">Plato a la carta</option>
+            <option value="servicio">Servicio</option>
+          </select>
+        </Field>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Precio (USD)"><input className={inputCls} type="number" step="0.01" value={precio} onChange={(e) => setPrecio(e.target.value)} placeholder="0.00" /></Field>
+        <Field label="Presentación / unidad"><input className={inputCls} value={unidad} onChange={(e) => setUnidad(e.target.value)} placeholder="Ej. 500ml, porción" /></Field>
+      </div>
+      {tipo === "producto" && <Field label="Stock disponible"><input className={inputCls} type="number" value={stock} onChange={(e) => setStock(e.target.value)} placeholder="Cantidad en inventario" /></Field>}
+      <button onClick={submit} disabled={!nombre.trim() || !precio} className="w-full mt-2 py-3 rounded-lg font-semibold text-sm text-white bg-[#2B2620] hover:bg-[#3E372D] disabled:opacity-40 transition-colors flex items-center justify-center gap-2">
+        <Boxes size={16} /> {inicial ? "Guardar cambios" : "Agregar al inventario"}
+      </button>
+    </div>
+  );
+}
+
+function VistaInventario({ inventario, setInventario }) {
+  const [modal, setModal] = useState(null); // null | true | producto-a-editar
+  const [filtro, setFiltro] = useState("Todos");
+
+  const filtrados = filtro === "Todos" ? inventario : inventario.filter((p) => p.categoria === filtro);
+
+  const guardar = (p) => {
+    setInventario((prev) => (prev.some((x) => x.id === p.id) ? prev.map((x) => (x.id === p.id ? p : x)) : [p, ...prev]));
+  };
+  const eliminar = (id) => setInventario((prev) => prev.filter((p) => p.id !== id));
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4 gap-3">
+        <p className="text-sm text-[#8A8273]">Productos, platos a la carta y servicios disponibles, con precio y stock.</p>
+        <button onClick={() => setModal(true)} className="px-3.5 py-2 rounded-lg bg-[#2B2620] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#3E372D] transition-colors shrink-0 whitespace-nowrap">
+          <Plus size={14} /> Agregar
+        </button>
+      </div>
+
+      <div className="flex gap-2 mb-5 overflow-x-auto pb-1">
+        <button onClick={() => setFiltro("Todos")} className="px-3.5 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all" style={{ backgroundColor: filtro === "Todos" ? "#2B2620" : "#F0EBE0", color: filtro === "Todos" ? "white" : "#6B6358" }}>Todos</button>
+        {Object.entries(CONSUMO_INFO).map(([k, v]) => (
+          <button key={k} onClick={() => setFiltro(k)} className="px-3.5 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all" style={{ backgroundColor: filtro === k ? "#2B2620" : "#F0EBE0", color: filtro === k ? "white" : "#6B6358" }}>{v.label}</button>
+        ))}
+      </div>
+
+      <div className="space-y-2">
+        {filtrados.map((p) => {
+          const Icon = CONSUMO_INFO[p.categoria]?.icon || Package;
+          return (
+            <div key={p.id} className="bg-white rounded-xl border border-[#EDE7DA] p-3.5 flex items-center gap-3">
+              <div className="w-9 h-9 rounded-lg bg-[#FBF3E9] text-[#9C6B3E] flex items-center justify-center shrink-0"><Icon size={16} /></div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-[#2B2620] truncate">{p.nombre}</p>
+                <p className="text-[11px] text-[#A39C8F]">
+                  {CONSUMO_INFO[p.categoria]?.label} · {p.tipo} {p.unidad && `· ${p.unidad}`}
+                  {p.tipo === "producto" && <> · Stock: {p.stock ?? 0}</>}
+                </p>
+              </div>
+              <p className="text-sm font-semibold text-[#9C6B3E] shrink-0">${p.precio.toFixed(2)}</p>
+              <button onClick={() => setModal(p)} className="p-1.5 text-[#8A8273] hover:text-[#2B2620] shrink-0"><Edit3 size={14} /></button>
+              <button onClick={() => eliminar(p.id)} className="p-1.5 text-[#8A8273] hover:text-[#9C4221] shrink-0"><Trash2 size={14} /></button>
+            </div>
+          );
+        })}
+      </div>
+
+      <Modal open={!!modal} onClose={() => setModal(null)} title={modal && modal !== true ? "Editar artículo" : "Agregar al inventario"}>
+        <FormProducto inicial={modal !== true ? modal : null} onSave={guardar} onClose={() => setModal(null)} />
+      </Modal>
+    </div>
+  );
+}
+
+// ================= APP PRINCIPAL =================
+export default function App() {
+  const [huespedes, setHuespedes] = useState(SEED_HUESPEDES);
+  const [consumos, setConsumos] = useState(SEED_CONSUMOS);
+  const [contratos, setContratos] = useState(SEED_CONTRATOS);
+  const [inventario, setInventario] = useState(SEED_INVENTARIO);
+  const [invitados, setInvitados] = useState(SEED_INVITADOS);
+  const [solicitudes, setSolicitudes] = useState([]);
+  const [vista, setVista] = useState("recepcion");
+  const [modalSolicitud, setModalSolicitud] = useState(null);
+
+  const resolverSolicitud = (id, decision) => {
+    setSolicitudes((prev) => prev.map((s) => (s.id === id ? { ...s, estado: decision } : s)));
+    if (decision === "aprobado") {
+      const sol = solicitudes.find((s) => s.id === id);
+      if (sol) setHuespedes((prev) => prev.map((h) => (h.id === sol.huespedId ? { ...h, [sol.campo]: sol.valorNuevo } : h)));
+    }
+  };
+
+  const togglePagoEstadia = (registroId) => setHuespedes((prev) => prev.map((h) => (h.id === registroId ? { ...h, estadoPago: h.estadoPago === "pagado" ? "pendiente" : "pagado" } : h)));
+
+  // Marca/desmarca un día puntual en el calendario de una estadía. Si el registro
+  // todavía no tiene días manuales, se inicializa desde su rango check-in/check-out.
+  const toggleDiaHospedaje = (registroId, fecha) => {
+    if (!registroId) return;
+    setHuespedes((prev) => prev.map((h) => {
+      if (h.id !== registroId) return h;
+      const actuales = h.diasHospedaje && h.diasHospedaje.length ? h.diasHospedaje : rangoDias(h.checkIn, h.checkOut);
+      const set = new Set(actuales);
+      if (set.has(fecha)) set.delete(fecha); else set.add(fecha);
+      const nuevos = Array.from(set).sort();
+      return { ...h, diasHospedaje: nuevos };
+    }));
+  };
+
+  const exportarBaseDatos = () => {
+    const data = { huespedes, consumos, contratos, inventario, invitados, solicitudes, exportadoEl: new Date().toISOString() };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `hotel-export-${HOY}.json`; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Exportación a Excel (.xlsx) con hojas separadas: huéspedes, invitados, consumos y cargos/pagos.
+  const exportarExcel = () => {
+    const perfiles = construirPerfiles(huespedes);
+
+    const hojaHuespedes = huespedes.map((h) => {
+      const dias = diasDeRegistro(h).length;
+      const cs = consumos.filter((c) => c.huespedId === h.id);
+      const totalConsumos = cs.reduce((s, c) => s + c.monto, 0);
+      const totalAlojamiento = (h.tarifaNoche || 0) * dias;
+      return {
+        ID: h.id, Tipo: TIPO_INFO[h.tipo].label, Nombre: h.nombre, Documento: h.doc, Teléfono: h.telefono || "",
+        Correo: h.email || "", Entidad: h.entidad || "", Habitacion_Espacio: h.habitacion, Check_In: h.checkIn,
+        Check_Out: h.checkOut || "", Dias_Hospedado: dias, Estado: h.estado, Tarifa_Noche: h.tarifaNoche || 0,
+        Total_Alojamiento: Number(totalAlojamiento.toFixed(2)), Total_Consumos: Number(totalConsumos.toFixed(2)),
+        Total_A_Pagar: Number((totalAlojamiento + totalConsumos).toFixed(2)), Estado_Pago: h.estadoPago,
+        Observaciones: h.observaciones || "",
+      };
+    });
+
+    const hojaInvitados = invitados.map((i) => {
+      const evento = contratos.find((c) => c.id === i.eventoId);
+      return {
+        ID: i.id, Evento_Contrato: evento ? `${evento.entidad} (${evento.numero})` : i.eventoId, Apellidos: i.apellidos,
+        Nombres: i.nombres, Cedula: i.cedula, Numero_Documento: i.numeroDocumento || "", Nacionalidad: i.nacionalidad || "",
+        Fecha_Nacimiento: i.fechaNacimiento || "", Fecha_Vencimiento: i.fechaVencimiento || "", Sexo: i.sexo || "",
+        Estado_Civil: i.estadoCivil || "", Lugar_Nacimiento: i.lugarNacimiento || "",
+        Nombre_Padre: i.nombrePadre || "", Nombre_Madre: i.nombreMadre || "", Tipo_Sangre: i.tipoSangre || "", Donante: i.donante || "",
+        Lugar_Fecha_Emision: i.lugarFechaEmision || "", Telefono: i.telefono || "",
+        Correo: i.email || "", Fecha_Asistencia: i.fechaAsistencia, Observaciones: i.observaciones || "",
+        Asistencia_Confirmada: i.asistenciaConfirmada ? "Sí" : "No",
+        Verificada_Por_OCR: i.asistenciaConfirmada ? (i.cedulaVerificacionCoincide ? "Sí (cédula coincide)" : "No (confirmación manual)") : "",
+        Hora_Confirmacion: i.horaConfirmacion ? new Date(i.horaConfirmacion).toLocaleString("es-EC") : "",
+      };
+    });
+
+    const hojaConsumos = consumos.map((c) => {
+      const h = huespedes.find((x) => x.id === c.huespedId);
+      return {
+        ID: c.id, Huesped: h?.nombre || c.huespedId, Categoria: CONSUMO_INFO[c.categoria]?.label || c.categoria,
+        Producto_Detalle: c.detalle, Cantidad: c.cantidad || 1, Precio_Unitario: c.precioUnitario ?? c.monto,
+        Monto_Total: c.monto, Fecha: c.fecha, Pagado_Por: c.pagadoPor === "empresa" ? "Empresa/Entidad" : "Huésped",
+        Estado_Pago: c.estadoPago,
+      };
+    });
+
+    const hojaCargos = perfiles.map((p) => {
+      const cs = consumos.filter((c) => p.registros.some((r) => r.id === c.huespedId));
+      const totalConsumos = cs.reduce((s, c) => s + c.monto, 0);
+      const totalAlojamiento = p.registros.reduce((s, r) => s + (r.tarifaNoche || 0) * diasDeRegistro(r).length, 0);
+      const pendiente = p.registros.some((r) => r.estadoPago === "pendiente");
+      return {
+        Cliente: p.nombre, Documento: p.doc, Entidad: p.entidad || "", Tipo: TIPO_INFO[p.tipo].label,
+        Total_Alojamiento: Number(totalAlojamiento.toFixed(2)), Total_Consumos: Number(totalConsumos.toFixed(2)),
+        Total_A_Pagar: Number((totalAlojamiento + totalConsumos).toFixed(2)),
+        Estado_Pago: pendiente ? "Pendiente" : "Pagado",
+      };
+    });
+
+    const hojaInventario = inventario.map((p) => ({
+      ID: p.id, Nombre: p.nombre, Categoria: CONSUMO_INFO[p.categoria]?.label || p.categoria, Tipo: p.tipo,
+      Precio: p.precio, Unidad: p.unidad, Stock: p.stock ?? "N/A",
+    }));
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaHuespedes), "Huéspedes");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaInvitados), "Invitados");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaConsumos), "Consumos");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaCargos), "Cargos y pagos");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaInventario), "Inventario");
+    XLSX.writeFile(wb, `hotel-datos-${HOY}.xlsx`);
+  };
+
+  const TABS = [
+    { id: "recepcion", label: "Recepción" },
+    { id: "clientes", label: "Clientes" },
+    { id: "invitados", label: "Invitados" },
+    { id: "inventario", label: "Inventario" },
+    { id: "contratos", label: "Contratos" },
+    { id: "metricas", label: "Métricas" },
+    { id: "cliente", label: "Auto-registro" },
+  ];
+
+  return (
+    <div className="min-h-screen bg-[#F7F4EE]" style={{ fontFamily: "'Inter', sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600;700&display=swap');
+        .font-serif { font-family: 'Fraunces', serif; }
+      `}</style>
+
+      <header className="bg-[#2B2620] text-white px-5 py-4 sticky top-0 z-30">
+        <div className="max-w-2xl mx-auto flex items-center justify-between gap-3">
+          <div className="shrink-0">
+            <p className="font-serif text-lg leading-tight">Registro de Huéspedes</p>
+            <p className="text-[11px] text-[#C2B9A6]">{HOY}</p>
+          </div>
+          {vista !== "cliente" && (
+            <div className="flex gap-1.5 shrink-0">
+              <button onClick={exportarExcel} className="p-2 rounded-lg bg-[#3E372D] text-[#C2B9A6] hover:text-white transition-colors" title="Exportar a Excel (.xlsx)">
+                <FileText size={16} />
+              </button>
+              <button onClick={exportarBaseDatos} className="p-2 rounded-lg bg-[#3E372D] text-[#C2B9A6] hover:text-white transition-colors" title="Exportar base de datos (JSON)">
+                <Download size={16} />
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="max-w-2xl mx-auto flex gap-1 bg-[#3E372D] rounded-lg p-1 mt-3 overflow-x-auto">
+          {TABS.map((t) => (
+            <button key={t.id} onClick={() => setVista(t.id)} className="px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap" style={{ backgroundColor: vista === t.id ? "#9C6B3E" : "transparent", color: vista === t.id ? "white" : "#C2B9A6" }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      <main className="max-w-2xl mx-auto px-5 py-6">
+        {vista === "recepcion" && (
+          <VistaRecepcion huespedes={huespedes} consumos={consumos} contratos={contratos} inventario={inventario} setHuespedes={setHuespedes} setConsumos={setConsumos} solicitudes={solicitudes} onResolverSolicitud={resolverSolicitud} />
+        )}
+        {vista === "clientes" && (
+          <VistaClientes huespedes={huespedes} consumos={consumos} contratos={contratos} onSolicitarEdicion={setModalSolicitud} onTogglePagoEstadia={togglePagoEstadia} onToggleDiaHospedaje={toggleDiaHospedaje} />
+        )}
+        {vista === "invitados" && (
+          <VistaInvitados invitados={invitados} setInvitados={setInvitados} contratos={contratos} />
+        )}
+        {vista === "inventario" && <VistaInventario inventario={inventario} setInventario={setInventario} />}
+        {vista === "contratos" && <VistaContratos contratos={contratos} setContratos={setContratos} />}
+        {vista === "metricas" && <VistaMetricas huespedes={huespedes} consumos={consumos} inventario={inventario} />}
+        {vista === "cliente" && <VistaCliente onEnviar={(h) => setHuespedes((prev) => [h, ...prev])} />}
+      </main>
+
+      <Modal open={!!modalSolicitud} onClose={() => setModalSolicitud(null)} title="Solicitar corrección de datos">
+        {modalSolicitud && <FormSolicitudEdicion huesped={modalSolicitud} onEnviar={(s) => setSolicitudes((prev) => [s, ...prev])} onClose={() => setModalSolicitud(null)} />}
+      </Modal>
+    </div>
+  );
+}
